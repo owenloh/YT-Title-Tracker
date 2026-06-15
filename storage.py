@@ -384,10 +384,12 @@ def get_active_videos() -> List[dict]:
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
-                "SELECT video_id, channel_id, published_at, comment_id "
-                "FROM videos "
-                "WHERE is_active = TRUE AND is_ignored = FALSE AND is_deleted = FALSE AND comment_id IS NOT NULL "
-                "ORDER BY published_at DESC"
+                "SELECT v.video_id, v.channel_id, c.display_name AS channel_name, "
+                "       v.published_at, v.comment_id "
+                "FROM videos v JOIN channels c ON v.channel_id = c.channel_id "
+                "WHERE v.is_active = TRUE AND v.is_ignored = FALSE AND v.is_deleted = FALSE "
+                "      AND v.comment_id IS NOT NULL "
+                "ORDER BY v.published_at DESC"
             )
             return [dict(row) for row in cur.fetchall()]
     finally:
@@ -472,7 +474,7 @@ def is_video_active(video_id: str, inactive_days: int) -> bool:
                 SELECT DATE(sampled_at) as sample_date, COUNT(DISTINCT title_text) as title_count
                 FROM title_samples
                 WHERE video_id = %s
-                  AND sampled_at >= CURRENT_DATE - INTERVAL '%s days'
+                  AND sampled_at >= CURRENT_DATE - make_interval(days => %s)
                 GROUP BY DATE(sampled_at)
                 ORDER BY sample_date DESC
                 LIMIT %s

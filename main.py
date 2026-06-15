@@ -31,7 +31,6 @@ from storage import (
     get_title_history_by_date,
     get_title_stats,
     get_total_samples,
-    get_unique_titles_for_date,
     get_videos_without_comments,
     init_db,
     is_video_active,
@@ -66,158 +65,143 @@ def reprocess_videos_without_comments():
         print(f"[{channel_name}] Spawned reprocess task for {video_id}")
 
 
-def build_comment_text(video_id: str, is_finalized: bool = False) -> str:
-    """Build comment text with historical title changes."""
-    history = get_title_history_by_date(video_id)
-    
-    # Random intro line to avoid spam detection
-    intro = random.choice(COMMENT_INTROS)
-    
-    if not history:
-        # No history yet, get from stats
-        stats = get_title_stats(video_id)
-        if stats:
-            titles = [t for t, _ in stats]
+def render_comment(intro: str, history: list, stats: list) -> str:
+    """Pure comment formatter (no DB) so it can be unit tested.
+
+    history: [(date, [titles]), ...]   stats: [(title, count), ...]
+    """
+    if history:
+        # Timeline oldest -> newest, like a changelog: "Feb 07: Title A | Title B".
+        lines = [intro, ""]
+        for hist_date, titles in sorted(history, key=lambda x: x[0]):
+            date_str = hist_date.strftime("%b %d")
             if len(titles) == 1:
-                return f"{intro}\n\nCurrent title: {titles[0][:100]}"
+                lines.append(f"{date_str}: {titles[0][:90]}")
             else:
-                title_str = " | ".join(t[:60] for t in titles[:4])
+                shown = " | ".join(t[:60] for t in titles[:4])
                 if len(titles) > 4:
-                    title_str += f" (+{len(titles)-4})"
-                return f"{intro}\n\nTitles seen: {title_str}"
-        return intro
-    
-    # Build date-based format: "Feb 7: Title A | Title B"
-    lines = [intro, ""]
-    for hist_date, titles in history:
-        date_str = hist_date.strftime("%b %d")
+                    shown += f" (+{len(titles) - 4} more)"
+                lines.append(f"{date_str}: {shown}")
+        return "\n".join(lines)
+
+    if stats:
+        titles = [t for t, _ in stats]
         if len(titles) == 1:
-            lines.append(f"{date_str}: {titles[0][:80]}")
-        else:
-            title_str = " | ".join(t[:50] for t in titles[:4])
-            if len(titles) > 4:
-                title_str += f" (+{len(titles)-4})"
-            lines.append(f"{date_str}: {title_str}")
-    
-    return "\n".join(lines)
+            return f"{intro}\n\nCurrent title: {titles[0][:100]}"
+        shown = " | ".join(t[:60] for t in titles[:4])
+        if len(titles) > 4:
+            shown += f" (+{len(titles) - 4} more)"
+        return f"{intro}\n\nTitles seen: {shown}"
+
+    return intro
+
+
+def build_comment_text(video_id: str) -> str:
+    """Build comment text from this video's stored title history."""
+    intro = random.choice(COMMENT_INTROS)
+    return render_comment(intro, get_title_history_by_date(video_id), get_title_stats(video_id))
+
+
+def _maybe_update_comment(video_id: str, channel_name: str, before_text) -> None:
+    """Rebuild the comment and push an update only if its visible text changed.
+
+    Passing before_text=None forces an update regardless. Comparing against the
+    previously rendered text keeps YouTube API quota proportional to real changes.
+    """
+    if SKIP_COMMENT:
+        return
+    comment_id = get_comment_id(video_id)
+    if not comment_id:
+        return
+    after_text = build_comment_text(video_id)
+    if before_text is not None and after_text == before_text:
+        return
+    try:
+        if update_comment(comment_id, after_text):
+            update_comment_edited(video_id)
+            print(f"[{channel_name}] Updated comment for {video_id}", flush=True)
+    except Exception:
+        # 404/403 -> comment was deleted by the uploader; stop tracking it.
+        print(f"[{channel_name}] Comment deleted for {video_id} - marking ignored", flush=True)
+        mark_video_ignored(video_id)
+
+
+def _record_samples(video_id: str, titles: list) -> None:
+    """Persist raw samples and roll them into today's title history."""
+    if not titles:
+        return
+    for title in titles:
+        add_title_sample(video_id, title)
+    update_title_history(video_id, sorted(set(titles)), date.today())
 
 
 def process_video(video_id: str, channel_id: str, channel_name: str, published_at: datetime, fast_first: bool = True):
-    """Process a single video: sample titles, update stats, post/update comment.
-    
-    fast_first: If True and no comment exists yet, post quickly with fewer samples first,
-                then continue sampling in background.
+    """Sample a video's titles, store them, and post or update its comment.
+
+    fast_first: when True and no comment exists yet, post quickly from a small
+                parallel burst, then keep sampling and update the comment only if
+                new variants turn up.
     """
-    print(f"[{channel_name}] Processing video {video_id} (published {published_at.date()})")
-    
-    # Check if this is a new video (no comment yet)
-    existing_comment = get_comment_id(video_id)
-    
-    if fast_first and not existing_comment and not SKIP_COMMENT:
-        # FAST PATH: Get quick samples in parallel, post comment ASAP
+    print(f"[{channel_name}] Processing {video_id} (published {published_at.date()})", flush=True)
+
+    new_video = not get_comment_id(video_id)
+
+    # FAST PATH: brand-new video -> get a comment up fast, then deepen.
+    if fast_first and new_video and not SKIP_COMMENT:
         try:
-            quick_titles = sample_titles(video_id, FAST_SAMPLES, parallel=True)
+            quick = sample_titles(video_id, FAST_SAMPLES, parallel=True)
         except Exception as e:
-            print(f"[{channel_name}] ERROR sampling titles for {video_id}: {e}", flush=True)
-            quick_titles = []
-        
-        if quick_titles:
-            try:
-                for title in quick_titles:
-                    add_title_sample(video_id, title)
-                
-                today = date.today()
-                update_title_history(video_id, list(set(quick_titles)), today)
-                
-                comment_text = build_comment_text(video_id, is_finalized=False)
-                new_id, status = post_comment(video_id, comment_text)
-                if new_id:
-                    set_comment_id(video_id, new_id, status)
-                    print(f"[{channel_name}] Comment posted for {video_id} (status: {status})", flush=True)
-                elif status == "quota_exceeded":
-                    print(f"[{channel_name}] Quota exceeded - skipping comment for {video_id}", flush=True)
-                else:
-                    print(f"[{channel_name}] Failed to post comment for {video_id}", flush=True)
-            except Exception as e:
-                print(f"[{channel_name}] ERROR posting comment for {video_id}: {e}", flush=True)
-        
-        # Continue with more samples in background (sequential to be gentle)
-        remaining_samples = SAMPLES_PER_RUN - FAST_SAMPLES
-        if remaining_samples > 0:
-            titles = sample_titles(video_id, remaining_samples)
-            if titles:
-                for title in titles:
-                    add_title_sample(video_id, title)
-                
-                # Update history with all titles
-                all_titles = set(quick_titles) | set(titles)
-                update_title_history(video_id, list(all_titles), today)
-                
-                # Update comment with full data
-                comment_id = get_comment_id(video_id)
-                if comment_id and len(all_titles) > len(set(quick_titles)):
-                    # Only update if we found new titles
-                    comment_text = build_comment_text(video_id, is_finalized=False)
-                    if update_comment(comment_id, comment_text):
-                        update_comment_edited(video_id)
-                        print(f"[{channel_name}] Updated comment with {len(all_titles)} unique titles for {video_id}")
-        
+            print(f"[{channel_name}] ERROR sampling {video_id}: {e}", flush=True)
+            quick = []
+
+        if quick:
+            _record_samples(video_id, quick)
+            new_id, status = post_comment(video_id, build_comment_text(video_id))
+            if new_id:
+                set_comment_id(video_id, new_id, status)
+                print(f"[{channel_name}] Comment posted for {video_id} (status: {status})", flush=True)
+            elif status == "quota_exceeded":
+                print(f"[{channel_name}] Quota exceeded - no comment for {video_id}", flush=True)
+            else:
+                print(f"[{channel_name}] Failed to post comment for {video_id}", flush=True)
+
+        # Deepen sampling, then update the comment only if the content changed.
+        remaining = max(0, SAMPLES_PER_RUN - FAST_SAMPLES)
+        if remaining:
+            before = build_comment_text(video_id)
+            _record_samples(video_id, sample_titles(video_id, remaining))
+            _maybe_update_comment(video_id, channel_name, before)
+
         total = get_total_samples(video_id)
-        print(f"[{channel_name}] Video {video_id}: {total} total samples, {len(set(quick_titles + (titles if 'titles' in dir() else [])))} unique titles")
+        print(f"[{channel_name}] {video_id}: {total} samples, "
+              f"{len(get_title_stats(video_id))} distinct titles", flush=True)
         return
-    
-    # NORMAL PATH: Full sampling (for updates or if fast_first disabled)
+
+    # FULL PATH: existing comment, or commenting disabled.
+    before = None if new_video else build_comment_text(video_id)
     titles = sample_titles(video_id, SAMPLES_PER_RUN)
     if not titles:
-        print(f"[{channel_name}] No titles found for {video_id}")
+        print(f"[{channel_name}] No titles found for {video_id}", flush=True)
         return
-    
-    # Add samples
-    for title in titles:
-        add_title_sample(video_id, title)
-    
+    _record_samples(video_id, titles)
+
     total = get_total_samples(video_id)
-    print(f"[{channel_name}] Video {video_id}: {total} total samples, {len(set(titles))} unique titles")
-    
-    # Update title history for today
-    today = date.today()
-    unique_titles_today = set(titles)
-    update_title_history(video_id, list(unique_titles_today), today)
-    
+    print(f"[{channel_name}] {video_id}: {total} samples, "
+          f"{len(get_title_stats(video_id))} distinct titles", flush=True)
+
     if SKIP_COMMENT:
-        print(f"[{channel_name}] SKIP_COMMENT=1: skipping comment")
         return
-    
-    if total < MIN_SAMPLES_TO_POST:
-        print(f"[{channel_name}] Skipping comment (need {MIN_SAMPLES_TO_POST}+ samples)")
-        return
-    
-    # Check if video is finalized (non-active)
-    finalized = not is_video_active(video_id, INACTIVE_DAYS_THRESHOLD)
-    
-    # Build comment
-    comment_text = build_comment_text(video_id, finalized)
-    
-    # Post or update comment
+
     comment_id = get_comment_id(video_id)
     if comment_id:
-        try:
-            if update_comment(comment_id, comment_text):
-                update_comment_edited(video_id)
-                print(f"[{channel_name}] Updated comment for {video_id}")
-            else:
-                print(f"[{channel_name}] Failed to update comment for {video_id}")
-        except Exception:
-            # Comment was deleted (404/403)
-            print(f"[{channel_name}] Comment deleted for {video_id} - marking as ignored")
-            mark_video_ignored(video_id)
+        _maybe_update_comment(video_id, channel_name, before)
     else:
-        new_id = post_comment(video_id, comment_text)
+        new_id, status = post_comment(video_id, build_comment_text(video_id))
         if new_id:
-            set_comment_id(video_id, new_id)
-            print(f"[{channel_name}] Posted new comment for {video_id}")
+            set_comment_id(video_id, new_id, status)
+            print(f"[{channel_name}] Posted comment for {video_id}", flush=True)
         else:
-            print(f"[{channel_name}] Failed to post comment for {video_id}")
+            print(f"[{channel_name}] Failed to post comment for {video_id}", flush=True)
 
 
 def check_new_videos():
@@ -350,87 +334,33 @@ def check_active_videos():
     If a video has stagnated (same single title for N days), mark it inactive permanently.
     """
     print(f"\n=== Checking active videos at {datetime.now()} ===")
-    
+
     active_videos = get_active_videos()
     print(f"Found {len(active_videos)} active videos to check")
-    
+
     for video_info in active_videos:
         video_id = video_info["video_id"]
-        channel_id = video_info["channel_id"]
-        
+        channel_name = video_info.get("channel_name") or video_info["channel_id"]
+
         try:
-            # Check if video has stagnated
+            # Stagnated (same single title for N days straight) -> stop tracking.
+            # The comment already reflects the latest titles from prior checks, so
+            # there's nothing new to post here.
             if not is_video_active(video_id, INACTIVE_DAYS_THRESHOLD):
-                print(f"Video {video_id} has stagnated (same title for {INACTIVE_DAYS_THRESHOLD}+ days) - marking inactive")
+                print(f"[{channel_name}] {video_id} stagnated ({INACTIVE_DAYS_THRESHOLD}+ days) - marking inactive")
                 mark_video_inactive(video_id)
-                
-                # Update comment to show finalized
-                if not SKIP_COMMENT:
-                    comment_text = build_comment_text(video_id, is_finalized=True)
-                    comment_id = get_comment_id(video_id)
-                    if comment_id:
-                        try:
-                            if update_comment(comment_id, comment_text):
-                                update_comment_edited(video_id)
-                                print(f"Updated comment for {video_id} (finalized)")
-                        except Exception:
-                            pass
                 continue
+
             update_last_checked(video_id)
-            
-            # Get current unique titles
-            today = date.today()
-            current_titles = get_unique_titles_for_date(video_id, today)
-            
-            if not current_titles:
-                # Sample titles to get current state
-                titles = sample_titles(video_id, SAMPLES_PER_RUN)
-                if titles:
-                    for title in titles:
-                        add_title_sample(video_id, title)
-                    current_titles = set(titles)
-            
-            if not current_titles:
+
+            # Always re-sample so new variants are caught on every hourly pass.
+            before = build_comment_text(video_id)
+            titles = sample_titles(video_id, SAMPLES_PER_RUN)
+            if not titles:
                 continue
-            
-            # Get previous title set from history
-            history = get_title_history_by_date(video_id)
-            previous_titles = set()
-            if history and len(history) > 0:
-                # Get titles from most recent history entry before today
-                for hist_date, titles_list in history:
-                    if hist_date < today:
-                        previous_titles = set(titles_list)
-                        break
-                # If no previous date found, use the most recent entry if it's not today
-                if not previous_titles and history[0][0] < today:
-                    previous_titles = set(history[0][1])
-            
-            # Check if titles changed (by name, not percentage)
-            if current_titles != previous_titles:
-                print(f"Title change detected for {video_id}: {previous_titles} -> {current_titles}")
-                
-                # Update history
-                update_title_history(video_id, list(current_titles), today)
-                
-                # Update comment
-                if not SKIP_COMMENT:
-                    finalized = not is_video_active(video_id, INACTIVE_DAYS_THRESHOLD)
-                    comment_text = build_comment_text(video_id, finalized)
-                    comment_id = get_comment_id(video_id)
-                    
-                    if comment_id:
-                        try:
-                            if update_comment(comment_id, comment_text):
-                                update_comment_edited(video_id)
-                                print(f"Updated comment for {video_id}")
-                            else:
-                                print(f"Failed to update comment for {video_id}")
-                        except Exception:
-                            # Comment was deleted
-                            print(f"Comment deleted for {video_id} - marking as ignored")
-                            mark_video_ignored(video_id)
-        
+            _record_samples(video_id, titles)
+            _maybe_update_comment(video_id, channel_name, before)
+
         except Exception as e:
             print(f"Error checking video {video_id}: {e}", file=sys.stderr)
             import traceback

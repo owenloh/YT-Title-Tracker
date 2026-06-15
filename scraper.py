@@ -10,9 +10,18 @@ from youtube_comment import get_credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+import youtube_innertube
+
 RSS_URL = "https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
 WATCH_URL = "https://www.youtube.com/watch?v={video_id}"
 SHORTS_URL = "https://www.youtube.com/shorts/{video_id}"
+
+_CHANNEL_ID_RE = re.compile(r"^UC[A-Za-z0-9_-]{22}$")
+
+
+def _looks_like_channel_id(value: str) -> bool:
+    """True for a raw channel ID (UCxxxx...), False for an @handle or name."""
+    return bool(_CHANNEL_ID_RE.match(value.strip()))
 
 # Browser-like so we might get the same A/B variant as users
 HEADERS = {
@@ -213,12 +222,15 @@ def get_videos_from_rss(handle: str, expected_name: str = None, max_videos: int 
         [(video_id, published_at), ...] ordered newest first.
         published_at may be None if from channel page scrape.
     """
-    # Normalize handle
-    if not handle.startswith('@'):
-        handle = '@' + handle
-    
-    # Resolve handle to channel ID
-    channel_id = _resolve_handle_to_channel_id(handle, expected_name)
+    # Accept either a raw channel ID (UCxxx...) or an @handle. The old code blindly
+    # prepended '@' to everything, which turned a configured UC id into '@UCxxx'
+    # and never resolved -- the cause of the broken default config.
+    if _looks_like_channel_id(handle):
+        channel_id = handle.strip()
+    else:
+        if not handle.startswith('@'):
+            handle = '@' + handle
+        channel_id = _resolve_handle_to_channel_id(handle, expected_name)
     
     if not channel_id:
         print(f"Could not resolve {handle} to channel ID, trying channel page directly...")
@@ -327,8 +339,8 @@ def _parse_title_from_html(html: str) -> Optional[str]:
     return None
 
 
-def get_video_title(video_id: str) -> Optional[str]:
-    """Fetch watch page and parse title (og:title / <title> / JSON). Fallback: noembed."""
+def _scrape_title_via_html(video_id: str) -> Optional[str]:
+    """Last-resort title fetch via watch-page HTML, then noembed."""
     url = WATCH_URL.format(video_id=video_id)
     try:
         r = requests.get(url, headers=HEADERS, timeout=15)
@@ -338,7 +350,6 @@ def get_video_title(video_id: str) -> Optional[str]:
             return title
     except Exception:
         pass
-    # Fallback: noembed (third-party; may not reflect A/B variant but gets a title)
     try:
         noembed_url = f"https://noembed.com/embed?url=https://www.youtube.com/watch?v={video_id}"
         r = requests.get(noembed_url, headers=HEADERS, timeout=10)
@@ -351,29 +362,36 @@ def get_video_title(video_id: str) -> Optional[str]:
     return None
 
 
-def sample_titles(video_id: str, count: int, delay: float = 1.5, parallel: bool = False) -> List[str]:
-    """Fetch title `count` times to collect A/B samples.
-    
-    parallel=True: Fetch all at once (faster, but more aggressive)
-    parallel=False: Sequential with delay (slower, but gentler)
+def get_video_title(video_id: str) -> Optional[str]:
+    """Best-effort single title fetch: InnerTube JSON first, then HTML/noembed."""
+    title = youtube_innertube.fetch_one_title(video_id)
+    if title:
+        return title
+    return _scrape_title_via_html(video_id)
+
+
+def sample_titles(video_id: str, count: int, delay: float = 0.8, parallel: bool = False) -> List[str]:
+    """Sample a video's title `count` times to catch A/B variants.
+
+    Uses the InnerTube engine, which rotates a fresh viewer identity per sample so
+    different requests can land in different experiment buckets. Returns the flat
+    list of observed titles (may contain duplicates; callers dedupe as needed).
+
+    parallel=True fires requests concurrently for a fast first comment.
     """
-    if parallel and count > 1:
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        seen = []
-        with ThreadPoolExecutor(max_workers=min(count, 10)) as ex:
-            futures = [ex.submit(get_video_title, video_id) for _ in range(count)]
-            for f in as_completed(futures):
-                title = f.result()
-                if title:
-                    seen.append(title)
-        return seen
-    
-    # Sequential
-    seen = []
-    for i in range(count):
-        title = get_video_title(video_id)
+    titles = youtube_innertube.sample_variant_titles(
+        video_id, samples=count, delay=delay, parallel=parallel
+    )
+    if titles:
+        return titles
+
+    # InnerTube returned nothing (host blocked / endpoint down): fall back to a
+    # few HTML scrapes so we at least record the current title.
+    fallback = []
+    for i in range(min(count, 5)):
+        title = _scrape_title_via_html(video_id)
         if title:
-            seen.append(title)
+            fallback.append(title)
         if i < count - 1:
             time.sleep(delay)
-    return seen
+    return fallback
