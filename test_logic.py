@@ -1,6 +1,6 @@
 """
 Unit tests for the pure logic that doesn't touch the network or the database:
-  - InnerTube JSON parsing + identity-rotating sampler (youtube_innertube)
+  - InnerTube JSON parsing + cookieless variant sampler (youtube_innertube)
   - comment rendering (main.render_comment)
   - channel-id vs @handle detection (scraper._looks_like_channel_id)
 
@@ -54,9 +54,9 @@ _stub("googleapiclient.errors", HttpError=_HttpError)
 import youtube_innertube as it  # noqa: E402
 
 
-def _next_json(*titles, visitor=None):
+def _next_json(*titles):
     """Build a minimal /next response carrying the given watch-page title runs."""
-    body = {
+    return {
         "contents": {
             "twoColumnWatchNextResults": {
                 "results": {"results": {"contents": [
@@ -66,16 +66,10 @@ def _next_json(*titles, visitor=None):
             }
         }
     }
-    if visitor:
-        body["responseContext"] = {"visitorData": visitor}
-    return body
 
 
-def _player_json(title, visitor=None):
-    body = {"videoDetails": {"title": title}}
-    if visitor:
-        body["responseContext"] = {"visitorData": visitor}
-    return body
+def _player_json(title):
+    return {"videoDetails": {"title": title}}
 
 
 class TestNormalize(unittest.TestCase):
@@ -112,14 +106,13 @@ class TestExtract(unittest.TestCase):
 
 
 class TestSampler(unittest.TestCase):
-    def test_collects_multiple_variants_with_fresh_identity(self):
-        """The whole point: each sample is a fresh viewer, so we see all variants."""
+    def test_collects_multiple_variants_across_samples(self):
+        """Sampling repeatedly accumulates every variant, and rotates client surface."""
         variants = ["Variant A", "Variant B", "Variant C"]
-        calls = {"n": 0, "visitors": [], "clients": set()}
+        calls = {"n": 0, "clients": set()}
 
-        def fake_post(endpoint, video_id, client_key, visitor_data, timeout=15.0):
+        def fake_post(endpoint, video_id, client_key, timeout=15.0):
             calls["n"] += 1
-            calls["visitors"].append(visitor_data)
             calls["clients"].add(client_key)
             return _next_json(variants[calls["n"] % len(variants)])
 
@@ -130,12 +123,11 @@ class TestSampler(unittest.TestCase):
         finally:
             it._post = orig
 
-        self.assertEqual(set(observed), set(variants))            # all variants captured
-        self.assertTrue(all(v is None for v in calls["visitors"]))  # fresh identity each call
-        self.assertGreater(len(calls["clients"]), 1)              # client surface rotates
+        self.assertEqual(set(observed), set(variants))  # all variants captured
+        self.assertGreater(len(calls["clients"]), 1)    # client surface rotates
 
     def test_falls_back_to_player_when_next_empty(self):
-        def fake_post(endpoint, video_id, client_key, visitor_data, timeout=15.0):
+        def fake_post(endpoint, video_id, client_key, timeout=15.0):
             if endpoint == "next":
                 return {}  # no watch-page title available
             return _player_json("Player Title")
@@ -149,7 +141,7 @@ class TestSampler(unittest.TestCase):
         self.assertEqual(set(observed), {"Player Title"})
 
     def test_parallel_path(self):
-        def fake_post(endpoint, video_id, client_key, visitor_data, timeout=15.0):
+        def fake_post(endpoint, video_id, client_key, timeout=15.0):
             return _next_json("Only Title")
 
         orig = it._post
