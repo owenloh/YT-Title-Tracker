@@ -32,7 +32,6 @@ from storage import (
     get_comment_state,
     get_known_video_ids_for_channel,
     get_recent_title_stats,
-    get_title_history_by_date,
     get_title_stats,
     get_total_samples,
     get_videos_without_comments,
@@ -72,26 +71,38 @@ def reprocess_videos_without_comments():
 
 _MAX_VARIANTS_SHOWN = 6
 
+# A few body openers, picked deterministically per video so comments don't read
+# like copy-paste while staying stable across re-renders (see _pick).
+_BODY_LEADS = [
+    "Different people are being shown different titles on this one — right now it's roughly:",
+    "YouTube's quietly testing a few titles here. At the moment it's about:",
+    "Heads up: the title you see depends on who you are. Right now it's roughly:",
+    "Caught YouTube swapping the title around on this video. Lately it's about:",
+]
+
+
+def _pick(options: list, video_id: str, salt: str = "") -> str:
+    """Stable per-video choice from `options` (same video -> same pick)."""
+    idx = int(hashlib.md5((salt + video_id).encode()).hexdigest(), 16) % len(options)
+    return options[idx]
+
 
 def render_comment(intro: str, recent_stats: list, all_time_stats: list,
-                   history: list, window_days: int) -> str:
+                   video_id: str = "") -> str:
     """Pure comment formatter (no DB) so it can be unit tested.
 
     recent_stats:   [(title, count), ...] within the rolling window (current split)
     all_time_stats: [(title, count), ...] over all samples (which titles exist)
-    history:        [(date, [titles]), ...]   window_days: int
 
-    The displayed percentages come from the RECENT window so they reflect the
-    experiment's current ratio, not a lifetime blend. Titles seen earlier but not
-    in the window are listed separately ("Earlier also tested"). Full titles stay
-    on their own line (no mid-word truncation).
+    Percentages come from the RECENT window so they reflect the experiment's
+    current ratio. Reads like a person sharing an observation -- no robotic
+    footer/signature. Titles seen earlier but not lately are mentioned casually.
     """
     all_titles = [t for t, _ in all_time_stats]
     if not all_titles:
         return intro
     if len(all_titles) == 1:
-        # Not an A/B test we can demonstrate (we don't post until >= 2 anyway).
-        return f"{intro}\n\nOnly one title observed so far: {all_titles[0]}"
+        return f"{intro}\n\nOnly one title so far: {all_titles[0]}"
 
     # Current split: the recent window; fall back to all-time if the window is
     # empty (e.g. the video stopped being sampled).
@@ -100,19 +111,15 @@ def render_comment(intro: str, recent_stats: list, all_time_stats: list,
     ordered = sorted(basis, key=lambda x: x[1], reverse=True)
     total = sum(count for _, count in ordered)
 
-    lead = (f"Each viewer is shown just one of these — here's the split over the "
-            f"last {window_days} days:") if using_window else \
-           "Each viewer is shown just one of these — the titles I've caught:"
+    lead = _pick(_BODY_LEADS, video_id, "body") if using_window \
+        else "The different titles I've seen on this one:"
     lines = [intro, "", lead, ""]
-    for i, (title, count) in enumerate(ordered[:_MAX_VARIANTS_SHOWN], 1):
-        if total:
-            pct = max(1, round(100 * count / total))
-            lines.append(f"{i}. “{title}” — shown ~{pct}% of the time")
-        else:
-            lines.append(f"{i}. “{title}”")
+    for title, count in ordered[:_MAX_VARIANTS_SHOWN]:
+        pct = max(1, round(100 * count / total)) if total else None
+        lines.append(f"  • “{title}”" + (f" — about {pct}% of viewers" if pct else ""))
     extra = len(ordered) - _MAX_VARIANTS_SHOWN
     if extra > 0:
-        lines.append(f"…and {extra} more")
+        lines.append(f"  • …and {extra} more")
 
     # Titles seen historically but not in the current window.
     shown = {t for t, _ in ordered}
@@ -120,38 +127,25 @@ def render_comment(intro: str, recent_stats: list, all_time_stats: list,
     if retired:
         rstr = ", ".join(f"“{t}”" for t in retired[:3])
         if len(retired) > 3:
-            rstr += f" +{len(retired) - 3} more"
-        lines += ["", f"Earlier also tested: {rstr}"]
+            rstr += f" and {len(retired) - 3} more"
+        lines += ["", f"It was also testing {rstr} earlier on."]
 
-    first_date = min((d for d, _ in history), default=None) if history else None
-    lines.append("")
-    lines.append(
-        (f"First spotted {first_date.strftime('%b %d')} · " if first_date else "")
-        + "automated title-experiment tracker"
-    )
     return "\n".join(lines)
 
 
 def _intro_for(video_id: str) -> str:
-    """Pick an intro deterministically per video.
-
-    Using a stable hash (not random.choice) keeps re-renders identical unless the
-    underlying title data changes, so the hourly job doesn't re-edit the comment
-    -- and burn YouTube API quota -- just because the intro was re-randomized.
-    Still varies across videos so the comments don't look like copy-paste spam.
-    """
-    idx = int(hashlib.md5(video_id.encode()).hexdigest(), 16) % len(COMMENT_INTROS)
-    return COMMENT_INTROS[idx]
+    """Pick an intro deterministically per video (stable across re-renders so the
+    hourly job doesn't re-edit just because an intro was re-randomized)."""
+    return _pick(COMMENT_INTROS, video_id)
 
 
 def build_comment_text(video_id: str) -> str:
-    """Build comment text from this video's stored title history."""
+    """Build comment text from this video's stored title samples."""
     return render_comment(
         _intro_for(video_id),
         get_recent_title_stats(video_id, RATIO_WINDOW_DAYS),
         get_title_stats(video_id),
-        get_title_history_by_date(video_id),
-        RATIO_WINDOW_DAYS,
+        video_id,
     )
 
 

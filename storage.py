@@ -291,6 +291,23 @@ def get_recent_title_stats(video_id: str, days: int) -> List[Tuple[str, int]]:
         return_conn(conn)
 
 
+def get_title_daily_counts(video_id: str) -> List[dict]:
+    """Per-day, per-title sample counts for the history timeline:
+    [{day, title, count}, ...] ordered oldest day first."""
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT DATE(sampled_at) AS day, title_text AS title, COUNT(*) AS count "
+                "FROM title_samples WHERE video_id = %s "
+                "GROUP BY day, title_text ORDER BY day ASC",
+                (video_id,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+    finally:
+        return_conn(conn)
+
+
 def get_total_samples(video_id: str) -> int:
     """Get total number of samples for a video."""
     conn = get_conn()

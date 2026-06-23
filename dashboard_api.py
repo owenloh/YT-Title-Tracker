@@ -4,7 +4,7 @@ from datetime import datetime, date
 from flask import Flask, jsonify, send_file
 from flask_cors import CORS
 
-from storage import get_all_videos_summary, get_video_info, init_db
+from storage import get_all_videos_summary, get_title_daily_counts, get_video_info, init_db
 
 app = Flask(__name__)
 CORS(app)  # Allow frontend to call from any origin
@@ -76,8 +76,13 @@ def get_video(video_id: str):
         # Convert datetime/date objects
         for key, value in video.items():
             video[key] = serialize_value(value)
-        
-        return jsonify({"video": video})
+
+        # Per-day title breakdown for the history timeline.
+        timeline = get_title_daily_counts(video_id)
+        for row in timeline:
+            row["day"] = serialize_value(row["day"])
+
+        return jsonify({"video": video, "timeline": timeline})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

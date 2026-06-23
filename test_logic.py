@@ -172,17 +172,20 @@ class TestRenderComment(unittest.TestCase):
         out = self.render("INTRO",
                           [("A", 90), ("B", 10)],            # recent window
                           [("A", 500), ("B", 500)],          # all-time (50/50)
-                          [(date(2026, 2, 7), ["A", "B"])],
-                          3)
+                          "vid1")
         self.assertTrue(out.startswith("INTRO"))
-        self.assertIn("~90%", out)
-        self.assertIn("~10%", out)
-        self.assertIn("last 3 days", out)        # window is labelled
-        self.assertIn("Feb 07", out)             # first-spotted date
+        self.assertIn("90%", out)
+        self.assertIn("10%", out)
+
+    def test_no_robotic_footer(self):
+        out = self.render("INTRO", [("A", 90), ("B", 10)], [("A", 90), ("B", 10)], "vid1")
+        self.assertNotIn("automated", out)
+        self.assertNotIn("tracker", out)
+        self.assertNotIn("First spotted", out)
 
     def test_variants_sorted_by_frequency(self):
         out = self.render("INTRO", [("Rare", 2), ("Common", 98)],
-                          [("Rare", 2), ("Common", 98)], [], 3)
+                          [("Rare", 2), ("Common", 98)], "vid1")
         self.assertLess(out.index("Common"), out.index("Rare"))
 
     def test_retired_titles_listed_separately(self):
@@ -190,29 +193,26 @@ class TestRenderComment(unittest.TestCase):
         out = self.render("INTRO",
                           [("A", 80), ("B", 20)],
                           [("A", 100), ("B", 40), ("Old", 30)],
-                          [(date(2026, 2, 7), ["A", "B", "Old"])],
-                          3)
-        self.assertIn("Earlier also tested", out)
+                          "vid1")
+        self.assertIn("also testing", out)
         self.assertIn("Old", out)
 
     def test_falls_back_to_all_time_when_window_empty(self):
-        out = self.render("INTRO", [], [("A", 30), ("B", 10)],
-                          [(date(2026, 2, 7), ["A", "B"])], 3)
+        out = self.render("INTRO", [], [("A", 30), ("B", 10)], "vid1")
         self.assertIn("A", out)
         self.assertIn("B", out)
-        self.assertNotIn("last 3 days", out)     # no window claim when falling back
 
     def test_single_title_makes_no_ab_claim(self):
-        out = self.render("INTRO", [("Only Title", 9)], [("Only Title", 40)], [], 3)
-        self.assertIn("Only one title observed so far: Only Title", out)
+        out = self.render("INTRO", [("Only Title", 9)], [("Only Title", 40)], "vid1")
+        self.assertIn("Only one title so far: Only Title", out)
 
     def test_caps_to_six_variants(self):
         stats = [(f"T{i}", 20 - i) for i in range(8)]
-        out = self.render("INTRO", stats, stats, [], 3)
+        out = self.render("INTRO", stats, stats, "vid1")
         self.assertIn("2 more", out)             # 8 variants -> 6 shown + "and 2 more"
 
     def test_empty(self):
-        self.assertEqual(self.render("INTRO", [], [], [], 3), "INTRO")
+        self.assertEqual(self.render("INTRO", [], [], "vid1"), "INTRO")
 
 
 class TestChannelIdDetection(unittest.TestCase):

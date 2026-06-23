@@ -112,6 +112,24 @@
   .when{color:var(--muted);white-space:nowrap}
   .dash{color:var(--faint)}
 
+  /* Expandable rows + history timeline */
+  tr.rowmain{cursor:pointer}
+  .chev{display:inline-block;color:var(--faint);font-size:10px;margin-right:2px;transition:transform .15s;flex:none}
+  tr.rowmain.expanded .chev{transform:rotate(90deg);color:var(--accent)}
+  tr.detail td{background:var(--surface-2);padding:0;border-bottom:1px solid var(--border)}
+  .tl-wrap{padding:16px 18px 18px}
+  .tl-cap{font-size:12px;color:var(--muted);margin-bottom:12px;font-weight:500}
+  .tl-chart{display:flex;align-items:flex-end;gap:6px;overflow-x:auto;padding-bottom:2px}
+  .tl-col{display:flex;flex-direction:column;align-items:center;gap:6px;flex:none}
+  .tl-bar{width:30px;height:88px;border-radius:5px;overflow:hidden;display:flex;flex-direction:column;background:#eceef2}
+  .tl-seg{width:100%}
+  .tl-day{font-size:10px;color:var(--faint);white-space:nowrap}
+  .tl-legend{display:flex;flex-wrap:wrap;gap:8px 18px;margin-top:14px}
+  .tl-key{display:flex;align-items:center;gap:7px;font-size:12px;max-width:300px}
+  .tl-key i{width:10px;height:10px;border-radius:3px;flex:none}
+  .tl-kt{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .tl-key b{color:var(--muted);font-weight:650;flex:none;font-variant-numeric:tabular-nums}
+  .tl-empty{padding:16px 18px;color:var(--faint);font-size:13px}
   .empty,.loading{text-align:center;padding:54px 20px;color:var(--muted)}
   .spin{width:22px;height:22px;border:2.5px solid var(--border);border-top-color:var(--accent);border-radius:50%;
         animation:rot .7s linear infinite;margin:0 auto 12px}
@@ -170,6 +188,8 @@
 <script>
 const VC = ['var(--v0)','var(--v1)','var(--v2)','var(--v3)','var(--v4)','var(--v5)'];
 let all = [], filter = 'active', windowDays = 3;
+const expanded = new Set();      // video_ids with the history timeline open
+const timelineCache = {};        // video_id -> timeline rows
 
 async function load(){
   try{
@@ -261,8 +281,9 @@ function render(){
   document.getElementById('rows').innerHTML = list.map(v=>{
     const url = `https://youtube.com/watch?v=${v.video_id}`;
     const thumb = `https://i.ytimg.com/vi/${v.video_id}/mqdefault.jpg`;
-    return `<tr>
+    return `<tr class="rowmain" data-id="${v.video_id}">
       <td><div class="vid">
+        <span class="chev">▶</span>
         <img class="thumb" loading="lazy" src="${thumb}" onerror="this.style.visibility='hidden'">
         <div class="meta">
           <div class="ch"><span class="sdot ${v.is_active?'on':'off'}" title="${v.is_active?'Active':'Inactive'}"></span>${esc(v.channel_name||'')}</div>
@@ -277,7 +298,72 @@ function render(){
       <td class="when">${fmt(v.published_at)}</td>
     </tr>`;
   }).join('');
+
+  // Re-open any timelines that were expanded before this refresh.
+  expanded.forEach(id=>{
+    const row = document.querySelector('#rows tr.rowmain[data-id="'+id+'"]');
+    if(row) openDetail(row, id); else expanded.delete(id);
+  });
 }
+
+function renderTimeline(video, timeline){
+  if(!timeline || !timeline.length) return '<div class="tl-empty">No samples recorded yet.</div>';
+  const order = (video.variants||[]).map(x=>x.title);
+  const colorOf = t => { let i = order.indexOf(t); if(i<0){ i = order.length; order.push(t); } return VC[i%VC.length]; };
+  const byDay = {};
+  timeline.forEach(r=>{ (byDay[r.day]=byDay[r.day]||{})[r.title]=(byDay[r.day][r.title]||0)+r.count; });
+  const days = Object.keys(byDay).sort();
+  const titles = []; order.forEach(t=>{ if(timeline.some(r=>r.title===t)) titles.push(t); });
+  timeline.forEach(r=>{ if(!titles.includes(r.title)) titles.push(r.title); });
+
+  const cols = days.map(day=>{
+    const m = byDay[day], tot = Object.values(m).reduce((a,b)=>a+b,0)||1;
+    const segs = titles.filter(t=>m[t]).map(t=>
+      `<div class="tl-seg" style="height:${100*m[t]/tot}%;background:${colorOf(t)}" title="${esc(t)} — ${Math.round(100*m[t]/tot)}%"></div>`).join('');
+    const lbl = new Date(day).toLocaleDateString(undefined,{month:'short',day:'numeric'});
+    return `<div class="tl-col"><div class="tl-bar">${segs}</div><div class="tl-day">${lbl}</div></div>`;
+  }).join('');
+
+  const last = byDay[days[days.length-1]]||{}, lastTot = Object.values(last).reduce((a,b)=>a+b,0)||1;
+  const legend = titles.map(t=>{
+    const pct = last[t] ? Math.round(100*last[t]/lastTot) : 0;
+    return `<div class="tl-key"><i style="background:${colorOf(t)}"></i><span class="tl-kt" title="${esc(t)}">${esc(t)}</span><b>${pct}%</b></div>`;
+  }).join('');
+
+  return `<div class="tl-wrap">
+    <div class="tl-cap">Daily share of each title — how YouTube shifted the experiment (legend % = latest day)</div>
+    <div class="tl-chart">${cols}</div>
+    <div class="tl-legend">${legend}</div>
+  </div>`;
+}
+
+function openDetail(row, id){
+  if(row.nextElementSibling && row.nextElementSibling.classList.contains('detail')) return;
+  row.classList.add('expanded');
+  const tr = document.createElement('tr');
+  tr.className = 'detail';
+  tr.innerHTML = '<td colspan="7"><div class="tl-empty">Loading history…</div></td>';
+  row.after(tr);
+  const video = all.find(v=>v.video_id===id) || {};
+  const draw = tl => { tr.firstElementChild.innerHTML = renderTimeline(video, tl); };
+  if(timelineCache[id]) draw(timelineCache[id]);
+  else fetch('/api/video/'+encodeURIComponent(id)).then(r=>r.json()).then(d=>{
+        timelineCache[id] = d.timeline || []; draw(timelineCache[id]);
+      }).catch(()=>{ tr.firstElementChild.innerHTML = '<div class="tl-empty">Could not load history.</div>'; });
+}
+function closeDetail(row){
+  const n = row.nextElementSibling;
+  if(n && n.classList.contains('detail')) n.remove();
+  row.classList.remove('expanded');
+}
+document.getElementById('rows').addEventListener('click', e=>{
+  if(e.target.closest('a')) return;            // let links work
+  const row = e.target.closest('tr.rowmain');
+  if(!row) return;
+  const id = row.dataset.id;
+  if(expanded.has(id)){ expanded.delete(id); closeDetail(row); }
+  else { expanded.add(id); openDetail(row, id); }
+});
 
 function engage(v, kind){
   if(!v.comment_id) return '<span class="dash">—</span>';
