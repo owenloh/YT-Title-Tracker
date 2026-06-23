@@ -1,6 +1,6 @@
 """
 Unit tests for the pure logic that doesn't touch the network or the database:
-  - InnerTube JSON parsing + identity-rotating sampler (youtube_innertube)
+  - InnerTube JSON parsing + cookieless variant sampler (youtube_innertube)
   - comment rendering (main.render_comment)
   - channel-id vs @handle detection (scraper._looks_like_channel_id)
 
@@ -54,9 +54,9 @@ _stub("googleapiclient.errors", HttpError=_HttpError)
 import youtube_innertube as it  # noqa: E402
 
 
-def _next_json(*titles, visitor=None):
+def _next_json(*titles):
     """Build a minimal /next response carrying the given watch-page title runs."""
-    body = {
+    return {
         "contents": {
             "twoColumnWatchNextResults": {
                 "results": {"results": {"contents": [
@@ -66,16 +66,10 @@ def _next_json(*titles, visitor=None):
             }
         }
     }
-    if visitor:
-        body["responseContext"] = {"visitorData": visitor}
-    return body
 
 
-def _player_json(title, visitor=None):
-    body = {"videoDetails": {"title": title}}
-    if visitor:
-        body["responseContext"] = {"visitorData": visitor}
-    return body
+def _player_json(title):
+    return {"videoDetails": {"title": title}}
 
 
 class TestNormalize(unittest.TestCase):
@@ -112,14 +106,13 @@ class TestExtract(unittest.TestCase):
 
 
 class TestSampler(unittest.TestCase):
-    def test_collects_multiple_variants_with_fresh_identity(self):
-        """The whole point: each sample is a fresh viewer, so we see all variants."""
+    def test_collects_multiple_variants_across_samples(self):
+        """Sampling repeatedly accumulates every variant, and rotates client surface."""
         variants = ["Variant A", "Variant B", "Variant C"]
-        calls = {"n": 0, "visitors": [], "clients": set()}
+        calls = {"n": 0, "clients": set()}
 
-        def fake_post(endpoint, video_id, client_key, visitor_data, timeout=15.0):
+        def fake_post(endpoint, video_id, client_key, timeout=15.0):
             calls["n"] += 1
-            calls["visitors"].append(visitor_data)
             calls["clients"].add(client_key)
             return _next_json(variants[calls["n"] % len(variants)])
 
@@ -130,12 +123,11 @@ class TestSampler(unittest.TestCase):
         finally:
             it._post = orig
 
-        self.assertEqual(set(observed), set(variants))            # all variants captured
-        self.assertTrue(all(v is None for v in calls["visitors"]))  # fresh identity each call
-        self.assertGreater(len(calls["clients"]), 1)              # client surface rotates
+        self.assertEqual(set(observed), set(variants))  # all variants captured
+        self.assertGreater(len(calls["clients"]), 1)    # client surface rotates
 
     def test_falls_back_to_player_when_next_empty(self):
-        def fake_post(endpoint, video_id, client_key, visitor_data, timeout=15.0):
+        def fake_post(endpoint, video_id, client_key, timeout=15.0):
             if endpoint == "next":
                 return {}  # no watch-page title available
             return _player_json("Player Title")
@@ -149,7 +141,7 @@ class TestSampler(unittest.TestCase):
         self.assertEqual(set(observed), {"Player Title"})
 
     def test_parallel_path(self):
-        def fake_post(endpoint, video_id, client_key, visitor_data, timeout=15.0):
+        def fake_post(endpoint, video_id, client_key, timeout=15.0):
             return _next_json("Only Title")
 
         orig = it._post
@@ -175,31 +167,30 @@ class TestRenderComment(unittest.TestCase):
         import main
         self.render = main.render_comment
 
-    def test_timeline_oldest_first(self):
-        history = [
-            (date(2026, 2, 9), ["New Title", "Another"]),
-            (date(2026, 2, 7), ["Original"]),
-        ]
-        out = self.render("INTRO", history, [])
-        lines = out.splitlines()
-        self.assertEqual(lines[0], "INTRO")
-        self.assertEqual(lines[1], "")
-        # Feb 07 must come before Feb 09 regardless of input order.
-        self.assertLess(out.index("Feb 07"), out.index("Feb 09"))
-        self.assertIn("Feb 09: New Title | Another", out)
+    def test_lists_variants_with_frequency(self):
+        out = self.render("INTRO",
+                          [(date(2026, 2, 7), ["Common", "Rare"])],
+                          [("Common", 90), ("Rare", 10)])
+        self.assertTrue(out.startswith("INTRO"))
+        self.assertIn("Common", out)
+        self.assertIn("Rare", out)
+        self.assertIn("~90%", out)              # observed frequency shown
+        self.assertIn("~10%", out)
+        self.assertIn("Feb 07", out)            # first-spotted date from history
 
-    def test_caps_to_four_titles(self):
-        history = [(date(2026, 2, 7), [f"T{i}" for i in range(6)])]
-        out = self.render("INTRO", history, [])
-        self.assertIn("(+2 more)", out)
+    def test_variants_sorted_by_frequency(self):
+        # input order shouldn't matter; the dominant title is listed first
+        out = self.render("INTRO", [], [("Rare", 2), ("Common", 98)])
+        self.assertLess(out.index("Common"), out.index("Rare"))
 
-    def test_stats_fallback_single(self):
+    def test_single_title_makes_no_ab_claim(self):
         out = self.render("INTRO", [], [("Only Title", 9)])
-        self.assertIn("Current title: Only Title", out)
+        self.assertIn("Only one title observed so far: Only Title", out)
 
-    def test_stats_fallback_multi(self):
-        out = self.render("INTRO", [], [("A", 5), ("B", 3)])
-        self.assertIn("Titles seen: A | B", out)
+    def test_caps_to_six_variants(self):
+        stats = [(f"T{i}", 20 - i) for i in range(8)]
+        out = self.render("INTRO", [], stats)
+        self.assertIn("2 more", out)            # 8 variants -> shows 6 + "and 2 more"
 
     def test_empty(self):
         self.assertEqual(self.render("INTRO", [], []), "INTRO")

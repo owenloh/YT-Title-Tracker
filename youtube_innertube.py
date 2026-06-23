@@ -13,17 +13,27 @@ website and apps use) and does two things the old scraper could not:
 
 1. Reads titles from structured JSON instead of fragile HTML regex, which is far
    more reliable from datacenter IPs (fewer consent/bot walls, no 403 HTML).
-2. Rotates a pool of fresh visitor identities (and client surfaces) so each
-   sample looks like a *different viewer* -- maximizing the set of A/B variants
-   we observe.
+2. Sends each request cookieless, so YouTube assigns it a fresh `visitorData`
+   automatically -- i.e. every sample is already a *different viewer* in an
+   independent experiment bucket, with no identity bookkeeping on our side.
+   (Verified empirically: N cookieless requests come back with N distinct
+   server-assigned identities, sequentially and in parallel.) We also rotate the
+   client surface (WEB/MWEB) to widen coverage a little further.
+
+What actually limits coverage is the NUMBER of samples, not identity. A/B splits
+are long-tailed in practice -- e.g. a real video measured here served
+94%/4%/2% across three titles, and the minority variants did not appear until
+samples ~32 and ~48. So catching them is a matter of sampling enough times
+(cumulatively, across the hourly re-sampling runs), not of "rotating identities".
 
 Honest limitation: no external tool can guarantee seeing every variant, because
-YouTube also buckets experiments partly by IP. Rotating identities + sampling
-over time gives the best achievable coverage from a single host.
+YouTube also buckets experiments partly by IP, and a single host sees only its
+own IP's slice. More samples over time gives the best achievable coverage.
 
-Quick check (run where YouTube is reachable):
+Quick check (run where YouTube is reachable; use a high count -- minority
+variants are rare, so ~50 samples is the floor for a skewed split):
 
-    python youtube_innertube.py dQw4w9WgXcQ 15
+    python youtube_innertube.py dQw4w9WgXcQ 50
 """
 import html as _html
 import json
@@ -131,22 +141,19 @@ def extract_titles_from_player(data: dict) -> Set[str]:
 # --------------------------------------------------------------------------- #
 # Network
 # --------------------------------------------------------------------------- #
-def _context(client_key: str, visitor_data: Optional[str]) -> dict:
+def _context(client_key: str) -> dict:
     c = _CLIENTS[client_key]
-    client = {
+    return {"client": {
         "clientName": c["clientName"],
         "clientVersion": c["clientVersion"],
         "hl": "en",
         "gl": "US",
-    }
-    if visitor_data:
-        client["visitorData"] = visitor_data
-    return {"client": client}
+    }}
 
 
-def _headers(client_key: str, visitor_data: Optional[str]) -> dict:
+def _headers(client_key: str) -> dict:
     c = _CLIENTS[client_key]
-    headers = {
+    return {
         "User-Agent": c["userAgent"],
         "Content-Type": "application/json",
         "Accept-Language": "en-US,en;q=0.9",
@@ -154,18 +161,20 @@ def _headers(client_key: str, visitor_data: Optional[str]) -> dict:
         "X-Youtube-Client-Name": c["clientNameId"],
         "X-Youtube-Client-Version": c["clientVersion"],
     }
-    if visitor_data:
-        headers["X-Goog-Visitor-Id"] = visitor_data
-    return headers
 
 
 def _post(endpoint: str, video_id: str, client_key: str,
-          visitor_data: Optional[str], timeout: float = 15.0) -> Optional[dict]:
-    """One InnerTube POST. Returns parsed JSON or None on any failure."""
+          timeout: float = 15.0) -> Optional[dict]:
+    """One InnerTube POST. Returns parsed JSON or None on any failure.
+
+    Sent cookieless and with no visitorData, so YouTube mints a fresh viewer
+    identity for this request -- that is what puts each sample in an independent
+    experiment bucket.
+    """
     url = _INNERTUBE_URL.format(endpoint=endpoint) + f"&key={_INNERTUBE_KEY}"
-    payload = {"context": _context(client_key, visitor_data), "videoId": video_id}
+    payload = {"context": _context(client_key), "videoId": video_id}
     try:
-        r = requests.post(url, headers=_headers(client_key, visitor_data),
+        r = requests.post(url, headers=_headers(client_key),
                           data=json.dumps(payload), timeout=timeout)
         if r.status_code != 200:
             return None
@@ -177,20 +186,19 @@ def _post(endpoint: str, video_id: str, client_key: str,
 def _sample_once(video_id: str, client_key: str) -> Set[str]:
     """One fresh viewer's view of the title(s).
 
-    We deliberately send no stored visitor identity, so YouTube assigns a new
-    visitor to this request -- the key to landing in different experiment buckets
-    across samples.
+    The request carries no visitor identity, so YouTube assigns a new viewer to
+    it -- that is what lands each sample in an independent experiment bucket.
     """
     titles: Set[str] = set()
 
     # /next carries the displayed watch-page title (the A/B variant the viewer sees).
-    nxt = _post("next", video_id, client_key, None)
+    nxt = _post("next", video_id, client_key)
     if nxt:
         titles |= extract_titles_from_next(nxt)
 
     # /player is a reliable backstop and a second experiment surface.
     if not titles:
-        ply = _post("player", video_id, client_key, None)
+        ply = _post("player", video_id, client_key)
         if ply:
             titles |= extract_titles_from_player(ply)
 
@@ -205,15 +213,17 @@ def fetch_one_title(video_id: str) -> Optional[str]:
     return None
 
 
-def sample_variant_titles(video_id: str, samples: int = 12, delay: float = 0.8,
+def sample_variant_titles(video_id: str, samples: int = 40, delay: float = 0.8,
                           jitter: float = 0.6, parallel: bool = False) -> List[str]:
     """
     Sample a video's title `samples` times, each as a fresh viewer, and return the
     flat list of observed titles (one or more per sample).
 
-    Each request omits any stored visitor identity (so YouTube assigns a new
-    visitor) and rotates the client surface, so samples are bucketed into
-    experiments independently -- maximizing the variants we observe.
+    Each request is cookieless, so YouTube assigns it a new viewer and buckets it
+    into experiments independently; the client surface is rotated too. Because A/B
+    splits are skewed, the count of observed variants grows with `samples` -- a
+    rare (~2-4%) variant typically needs dozens of samples to appear, so callers
+    should sample generously (and rely on cumulative re-sampling over time).
     `parallel=True` fires requests concurrently for the fast first comment.
     """
     if samples <= 0:
@@ -245,8 +255,8 @@ if __name__ == "__main__":
     import sys
 
     vid = sys.argv[1] if len(sys.argv) > 1 else "dQw4w9WgXcQ"
-    n = int(sys.argv[2]) if len(sys.argv) > 2 else 12
-    print(f"Sampling {vid} x{n} (rotating identities)...")
+    n = int(sys.argv[2]) if len(sys.argv) > 2 else 50
+    print(f"Sampling {vid} x{n} (fresh viewer per sample)...")
     counts = Counter(sample_variant_titles(vid, samples=n))
     if not counts:
         print("No titles returned -- is YouTube reachable from this host?")

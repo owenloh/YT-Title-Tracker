@@ -38,9 +38,16 @@ except ValueError:
 NEW_VIDEO_CHECK_INTERVAL = int(os.environ.get("NEW_VIDEO_CHECK_INTERVAL", "180"))  # 3 minutes
 ACTIVE_VIDEO_CHECK_INTERVAL = int(os.environ.get("ACTIVE_VIDEO_CHECK_INTERVAL", "3600"))  # 1 hour
 
-# Title sampling
-SAMPLES_PER_RUN = int(os.environ.get("SAMPLES_PER_RUN", "21"))
-FAST_SAMPLES = int(os.environ.get("FAST_SAMPLES", "5"))  # Quick samples before posting comment
+# Title sampling.
+# YouTube assigns a fresh viewer identity to every cookieless request, so each
+# sample already lands in an independent experiment bucket -- coverage is limited
+# by how MANY samples we take, not by identity. A/B splits are long-tailed in
+# practice (e.g. 94%/4%/2%), so a minority variant may not appear until ~sample
+# 30-50. These are cumulative per hourly run; over a few hours a video accrues
+# enough samples to surface ~2-4% variants. Catching a p% variant with 90%
+# confidence needs ~ ln(0.1)/ln(1-p) samples (~56 for 4%, ~115 for 2%).
+SAMPLES_PER_RUN = int(os.environ.get("SAMPLES_PER_RUN", "40"))
+FAST_SAMPLES = int(os.environ.get("FAST_SAMPLES", "15"))  # Quick samples before posting comment
 
 # Active/non-active logic: non-active if N days straight same single title
 INACTIVE_DAYS_THRESHOLD = int(os.environ.get("INACTIVE_DAYS_THRESHOLD", "5"))
