@@ -420,10 +420,14 @@ def check_active_videos():
             update_last_checked(video_id)
 
             # Always re-sample so new variants are caught on every hourly pass.
+            # parallel=True fires this video's samples concurrently (like the
+            # new-video fast path), so the hourly sweep of many active videos
+            # finishes in minutes instead of ~SAMPLES_PER_RUN*1.1s per video --
+            # important once a lot of channels are tracked.
             # _ensure_comment posts the first comment if this pass is what finally
             # pushes the video to >= 2 distinct titles, otherwise it updates.
             before = _distinct_titles(video_id)
-            titles = sample_titles(video_id, SAMPLES_PER_RUN)
+            titles = sample_titles(video_id, SAMPLES_PER_RUN, parallel=True)
             if not titles:
                 continue
             _record_samples(video_id, titles)
