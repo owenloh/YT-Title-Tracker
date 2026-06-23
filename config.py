@@ -49,6 +49,11 @@ ACTIVE_VIDEO_CHECK_INTERVAL = int(os.environ.get("ACTIVE_VIDEO_CHECK_INTERVAL", 
 SAMPLES_PER_RUN = int(os.environ.get("SAMPLES_PER_RUN", "40"))
 FAST_SAMPLES = int(os.environ.get("FAST_SAMPLES", "15"))  # Quick samples before posting comment
 
+# The displayed A/B split is computed over a rolling window, not lifetime, so it
+# reflects the experiment's CURRENT ratio (YouTube shifts traffic over time and
+# ends tests). Distinct-variant detection still uses all-time samples.
+RATIO_WINDOW_DAYS = int(os.environ.get("RATIO_WINDOW_DAYS", "3"))
+
 # Active/non-active logic: non-active if N days straight same single title
 INACTIVE_DAYS_THRESHOLD = int(os.environ.get("INACTIVE_DAYS_THRESHOLD", "5"))
 

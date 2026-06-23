@@ -93,11 +93,14 @@ def get_stats():
         active = [v for v in all_videos if v.get("is_active")]
         inactive = [v for v in all_videos if not v.get("is_active")]
         
+        from config import RATIO_WINDOW_DAYS
         return jsonify({
             "active_videos": len(active),
             "with_comments": sum(1 for v in active if v.get("comment_id")),
+            "multi_title": sum(1 for v in active if (v.get("unique_titles") or 0) >= 2),
             "inactive_videos": len(inactive),
             "total_in_db": len(all_videos),
+            "ratio_window_days": RATIO_WINDOW_DAYS,
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500

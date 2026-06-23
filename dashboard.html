@@ -1,154 +1,287 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>YouTube Title A/B Test Tracker</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: #f5f5f5;
-            color: #333;
-            padding: 20px;
-        }
-        .container { max-width: 1400px; margin: 0 auto; }
-        h1 { margin-bottom: 20px; }
-        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; margin-bottom: 20px; }
-        .stat-card {
-            background: white;
-            padding: 15px;
-            border-radius: 8px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-            text-align: center;
-        }
-        .stat-card h3 { font-size: 12px; color: #666; margin-bottom: 5px; }
-        .stat-card .value { font-size: 28px; font-weight: bold; }
-        .filters { margin-bottom: 15px; }
-        .filters button {
-            padding: 8px 16px;
-            margin-right: 8px;
-            border: 1px solid #ddd;
-            background: white;
-            border-radius: 4px;
-            cursor: pointer;
-        }
-        .filters button.active { background: #007bff; color: white; border-color: #007bff; }
-        table { width: 100%; background: white; border-collapse: collapse; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-        th, td { padding: 10px; text-align: left; border-bottom: 1px solid #eee; font-size: 14px; }
-        th { background: #f8f9fa; font-weight: 600; }
-        tr:hover { background: #f8f9fa; }
-        .badge { display: inline-block; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: 500; }
-        .badge.active { background: #28a745; color: white; }
-        .badge.inactive { background: #6c757d; color: white; }
-        .loading { text-align: center; padding: 40px; color: #666; }
-        a { color: #007bff; text-decoration: none; }
-        a:hover { text-decoration: underline; }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Title Test Tracker</title>
+<style>
+  :root{
+    --bg:#f5f6f8; --surface:#ffffff; --surface-2:#fbfbfc;
+    --border:#e9eaee; --border-strong:#dfe1e6;
+    --ink:#1b1d24; --muted:#6b7077; --faint:#9aa0a8;
+    --accent:#6366f1; --accent-soft:#eef0fe;
+    --green:#16a34a; --green-bg:#e7f6ec;
+    --amber:#c2790a; --amber-bg:#fbf0d9;
+    --red:#dc2626; --red-bg:#fceaea;
+    --slate:#64748b; --slate-bg:#eef1f4;
+    --shadow:0 1px 2px rgba(16,18,28,.04), 0 2px 6px rgba(16,18,28,.05);
+    --radius:14px;
+    --v0:#6366f1; --v1:#ec4899; --v2:#14b8a6; --v3:#f59e0b; --v4:#8b5cf6; --v5:#06b6d4;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{
+    font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;
+    background:var(--bg); color:var(--ink);
+    -webkit-font-smoothing:antialiased; line-height:1.45;
+    padding:28px 22px 60px;
+  }
+  .wrap{max-width:1180px;margin:0 auto}
+
+  /* Header */
+  header{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:26px;flex-wrap:wrap}
+  .brand{display:flex;align-items:center;gap:12px}
+  .logo{width:38px;height:38px;border-radius:11px;background:linear-gradient(135deg,#6366f1,#8b5cf6);
+        display:grid;place-items:center;box-shadow:var(--shadow);flex:none}
+  .logo::before{content:"";width:13px;height:13px;border-radius:4px;background:#fff;
+        clip-path:polygon(20% 12%,20% 88%,86% 50%)} /* play glyph */
+  .brand h1{font-size:20px;font-weight:700;letter-spacing:-.02em}
+  .brand p{font-size:12.5px;color:var(--muted);margin-top:1px}
+  .live{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--muted);
+        background:var(--surface);border:1px solid var(--border);padding:7px 12px;border-radius:999px;box-shadow:var(--shadow)}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 0 0 rgba(22,163,74,.5);animation:pulse 2s infinite}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(22,163,74,.45)}70%{box-shadow:0 0 0 6px rgba(22,163,74,0)}100%{box-shadow:0 0 0 0 rgba(22,163,74,0)}}
+
+  /* Stat cards */
+  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(168px,1fr));gap:14px;margin-bottom:22px}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+        padding:16px 18px;box-shadow:var(--shadow)}
+  .card .label{font-size:11.5px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--faint);display:flex;align-items:center;gap:6px}
+  .card .value{font-size:30px;font-weight:750;letter-spacing:-.02em;margin-top:7px;line-height:1}
+  .card .value small{font-size:13px;font-weight:500;color:var(--muted);margin-left:6px}
+  .card.accent .value{color:var(--accent)}
+
+  /* Toolbar */
+  .toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px;flex-wrap:wrap}
+  .seg{display:inline-flex;background:var(--surface);border:1px solid var(--border);border-radius:11px;padding:4px;gap:2px;box-shadow:var(--shadow)}
+  .seg button{border:0;background:transparent;color:var(--muted);font-size:13px;font-weight:600;
+        padding:7px 14px;border-radius:8px;cursor:pointer;transition:.15s;font-family:inherit}
+  .seg button:hover{color:var(--ink)}
+  .seg button.on{background:var(--accent);color:#fff;box-shadow:0 1px 2px rgba(99,102,241,.35)}
+  .hint{font-size:12px;color:var(--faint)}
+
+  /* Table */
+  .panel{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);overflow:hidden}
+  .scroll{overflow-x:auto}
+  table{width:100%;border-collapse:collapse;font-size:13.5px}
+  thead th{font-size:11px;font-weight:600;letter-spacing:.05em;text-transform:uppercase;color:var(--faint);
+        text-align:left;padding:13px 16px;background:var(--surface-2);border-bottom:1px solid var(--border);white-space:nowrap}
+  tbody td{padding:13px 16px;border-bottom:1px solid var(--border);vertical-align:middle}
+  tbody tr:last-child td{border-bottom:0}
+  tbody tr{transition:background .12s}
+  tbody tr:hover{background:var(--surface-2)}
+
+  /* Video cell */
+  .vid{display:flex;align-items:center;gap:11px;min-width:210px}
+  .thumb{width:62px;height:35px;border-radius:7px;object-fit:cover;background:var(--slate-bg);flex:none;border:1px solid var(--border)}
+  .vid .meta{min-width:0}
+  .vid .ch{font-weight:600;font-size:13px;display:flex;align-items:center;gap:6px}
+  .vid .id{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;color:var(--faint);text-decoration:none}
+  .vid .id:hover{color:var(--accent)}
+  .sdot{width:7px;height:7px;border-radius:50%;flex:none}
+  .sdot.on{background:var(--green)} .sdot.off{background:var(--faint)}
+
+  /* Variants */
+  .variants{min-width:320px;max-width:440px}
+  .v-row{margin:5px 0}
+  .v-row:first-child{margin-top:0} .v-row:last-child{margin-bottom:0}
+  .v-top{display:flex;justify-content:space-between;gap:10px;font-size:12.5px;margin-bottom:3px}
+  .v-title{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--ink)}
+  .v-pct{font-variant-numeric:tabular-nums;font-weight:650;color:var(--muted);flex:none}
+  .v-track{height:6px;border-radius:999px;background:#eef0f3;overflow:hidden}
+  .v-fill{height:100%;border-radius:999px}
+  .v-more{font-size:11.5px;color:var(--faint);margin-top:4px}
+  .v-none{color:var(--faint);font-size:13px}
+  .v-none b{color:var(--muted);font-weight:600}
+
+  /* Badges */
+  .badge{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;font-weight:600;
+        padding:4px 9px;border-radius:999px;white-space:nowrap}
+  .badge .bd{width:6px;height:6px;border-radius:50%}
+  .b-green{background:var(--green-bg);color:var(--green)} .b-green .bd{background:var(--green)}
+  .b-amber{background:var(--amber-bg);color:var(--amber)} .b-amber .bd{background:var(--amber)}
+  .b-red{background:var(--red-bg);color:var(--red)} .b-red .bd{background:var(--red)}
+  .b-slate{background:var(--slate-bg);color:var(--slate)} .b-slate .bd{background:var(--slate)}
+  .cmt{display:flex;align-items:center;gap:9px}
+  .cmt a{font-size:12px;color:var(--accent);text-decoration:none;font-weight:600}
+  .cmt a:hover{text-decoration:underline}
+  .num{font-variant-numeric:tabular-nums;font-weight:600}
+  .when{color:var(--muted);white-space:nowrap}
+  .dash{color:var(--faint)}
+
+  .empty,.loading{text-align:center;padding:54px 20px;color:var(--muted)}
+  .spin{width:22px;height:22px;border:2.5px solid var(--border);border-top-color:var(--accent);border-radius:50%;
+        animation:rot .7s linear infinite;margin:0 auto 12px}
+  @keyframes rot{to{transform:rotate(360deg)}}
+  footer{text-align:center;color:var(--faint);font-size:12px;margin-top:22px}
+</style>
 </head>
 <body>
-    <div class="container">
-        <h1>YouTube Title A/B Test Tracker</h1>
-        <div class="stats" id="stats"></div>
-        <div class="filters">
-            <button class="active" data-filter="active">Active</button>
-            <button data-filter="inactive">Inactive</button>
-            <button data-filter="all">All</button>
-        </div>
-        <div id="loading" class="loading">Loading...</div>
-        <table id="videos-table" style="display: none;">
-            <thead>
-                <tr>
-                    <th>Video</th>
-                    <th>Channel</th>
-                    <th>Published</th>
-                    <th>Status</th>
-                    <th>Titles</th>
-                    <th>Samples</th>
-                    <th>Comment</th>
-                </tr>
-            </thead>
-            <tbody id="videos-body"></tbody>
-        </table>
+<div class="wrap">
+  <header>
+    <div class="brand">
+      <div class="logo"></div>
+      <div>
+        <h1>Title Test Tracker</h1>
+        <p>Catching YouTube's A/B title experiments in the wild</p>
+      </div>
     </div>
-    <script>
-        let allVideos = [];
-        let currentFilter = 'active';
+    <div class="live"><span class="dot"></span><span id="updated">Live</span></div>
+  </header>
 
-        async function loadData() {
-            try {
-                const [statsRes, videosRes] = await Promise.all([
-                    fetch('/api/stats'),
-                    fetch('/api/videos')
-                ]);
-                if (!statsRes.ok || !videosRes.ok) throw new Error('Failed to load');
-                const stats = await statsRes.json();
-                const videos = await videosRes.json();
-                allVideos = videos.videos || [];
-                displayStats(stats);
-                filterVideos(currentFilter);
-                document.getElementById('loading').style.display = 'none';
-                document.getElementById('videos-table').style.display = 'table';
-            } catch (e) {
-                document.getElementById('loading').textContent = 'Error loading data';
-            }
-        }
+  <div class="stats" id="stats"></div>
 
-        function displayStats(stats) {
-            document.getElementById('stats').innerHTML = `
-                <div class="stat-card"><h3>Active</h3><div class="value">${stats.active_videos || 0}</div></div>
-                <div class="stat-card"><h3>With Comments</h3><div class="value">${stats.with_comments || 0}</div></div>
-                <div class="stat-card"><h3>Inactive</h3><div class="value">${stats.inactive_videos || 0}</div></div>
-                <div class="stat-card"><h3>Total</h3><div class="value">${stats.total_in_db || 0}</div></div>
-            `;
-        }
+  <div class="toolbar">
+    <div class="seg" id="filters">
+      <button data-f="active" class="on">Active</button>
+      <button data-f="tested">Being tested</button>
+      <button data-f="inactive">Inactive</button>
+      <button data-f="all">All</button>
+    </div>
+    <div class="hint" id="hint"></div>
+  </div>
 
-        function filterVideos(filter) {
-            currentFilter = filter;
-            document.querySelectorAll('.filters button').forEach(b => b.classList.remove('active'));
-            document.querySelector(`[data-filter="${filter}"]`).classList.add('active');
-            
-            let filtered = allVideos;
-            if (filter === 'active') filtered = allVideos.filter(v => v.is_active);
-            else if (filter === 'inactive') filtered = allVideos.filter(v => !v.is_active);
-            displayVideos(filtered);
-        }
+  <div class="panel">
+    <div class="scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>Video</th>
+            <th>Title variants <span id="splitlbl"></span></th>
+            <th>Comment</th>
+            <th>Samples</th>
+            <th>Published</th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+    <div id="state" class="loading"><div class="spin"></div>Loading…</div>
+  </div>
 
-        function displayVideos(videos) {
-            document.getElementById('videos-body').innerHTML = videos.map(v => {
-                const url = `https://youtube.com/watch?v=${v.video_id}`;
-                const commentUrl = v.comment_id ? `${url}&lc=${v.comment_id}` : '';
-                const status = v.is_active ? '<span class="badge active">Active</span>' : '<span class="badge inactive">Inactive</span>';
-                let comment = '-';
-                if (v.comment_id) {
-                    const statusText = v.comment_status === 'heldForReview' ? ' (held)' : 
-                                       v.comment_status === 'published' ? '' : 
-                                       v.comment_status ? ` (${v.comment_status})` : '';
-                    comment = `<a href="${commentUrl}" target="_blank">View${statusText}</a>`;
-                }
-                return `<tr>
-                    <td><a href="${url}" target="_blank">${v.video_id}</a></td>
-                    <td>${v.channel_name}</td>
-                    <td>${formatDate(v.published_at)}</td>
-                    <td>${status}</td>
-                    <td>${v.unique_titles || 0}</td>
-                    <td>${v.total_samples || 0}</td>
-                    <td>${comment}</td>
-                </tr>`;
-            }).join('');
-        }
+  <footer>Refreshes automatically every 30s · samples taken continuously across rotating viewers</footer>
+</div>
 
-        function formatDate(d) {
-            if (!d) return '-';
-            return new Date(d).toLocaleDateString();
-        }
+<script>
+const VC = ['var(--v0)','var(--v1)','var(--v2)','var(--v3)','var(--v4)','var(--v5)'];
+let all = [], filter = 'active', windowDays = 3;
 
-        document.querySelectorAll('.filters button').forEach(b => {
-            b.addEventListener('click', () => filterVideos(b.dataset.filter));
-        });
+async function load(){
+  try{
+    const [s,v] = await Promise.all([fetch('/api/stats'),fetch('/api/videos')]);
+    if(!s.ok||!v.ok) throw 0;
+    const stats = await s.json(), vids = await v.json();
+    all = vids.videos || [];
+    windowDays = stats.ratio_window_days || 3;
+    document.getElementById('splitlbl').textContent = `· split over last ${windowDays}d`;
+    renderStats(stats);
+    render();
+    stamp();
+    document.getElementById('state').style.display='none';
+  }catch(e){
+    document.getElementById('state').innerHTML = 'Could not load data — retrying…';
+  }
+}
 
-        loadData();
-        setInterval(loadData, 30000);
-    </script>
+function renderStats(s){
+  const cards = [
+    {label:'🎯 Active', value:s.active_videos||0, accent:false},
+    {label:'🔬 Being tested', value:s.multi_title||0, accent:true, sub:'2+ titles'},
+    {label:'💬 Comments', value:s.with_comments||0, accent:false},
+    {label:'📊 Total tracked', value:s.total_in_db||0, accent:false},
+  ];
+  document.getElementById('stats').innerHTML = cards.map(c=>`
+    <div class="card ${c.accent?'accent':''}">
+      <div class="label">${c.label}</div>
+      <div class="value">${c.value}${c.sub?`<small>${c.sub}</small>`:''}</div>
+    </div>`).join('');
+}
+
+function statusBadge(v){
+  if(!v.comment_id){
+    const pending = (v.unique_titles||0) >= 2;
+    return `<span class="badge b-slate"><span class="bd"></span>${pending?'Posting…':'—'}</span>`;
+  }
+  const map = {
+    published:['b-green','Live'], unknown:['b-green','Live'],
+    heldForReview:['b-amber','Held for review'],
+    likelySpam:['b-red','Flagged'], rejected:['b-slate','Rejected']
+  };
+  const [cls,label] = map[v.comment_status] || ['b-green','Live'];
+  const url = `https://youtube.com/watch?v=${v.video_id}&lc=${v.comment_id}`;
+  return `<div class="cmt"><span class="badge ${cls}"><span class="bd"></span>${label}</span>
+          <a href="${url}" target="_blank" rel="noopener">View</a></div>`;
+}
+
+function variantsCell(v){
+  const vs = (v.variants||[]);
+  if(vs.length <= 1){
+    const only = vs[0] ? esc(vs[0].title) : '—';
+    return `<div class="v-none">${vs.length?`<b>${trunc(only,60)}</b> · no test detected yet`:'—'}</div>`;
+  }
+  const useRecent = vs.some(x => (x.recent||0) > 0);
+  const val = x => useRecent ? (x.recent||0) : (x.count||0);
+  const ranked = [...vs].sort((a,b)=>val(b)-val(a));
+  const total = ranked.reduce((s,x)=>s+val(x),0) || 1;
+  const top = ranked.slice(0,4);
+  let html = top.map((x,i)=>{
+    const pct = Math.max(1, Math.round(100*val(x)/total));
+    return `<div class="v-row">
+      <div class="v-top"><span class="v-title" title="${esc(x.title)}">${esc(x.title)}</span><span class="v-pct">${pct}%</span></div>
+      <div class="v-track"><div class="v-fill" style="width:${pct}%;background:${VC[i%VC.length]}"></div></div>
+    </div>`;
+  }).join('');
+  if(ranked.length>top.length) html += `<div class="v-more">+${ranked.length-top.length} more variant${ranked.length-top.length>1?'s':''}</div>`;
+  return html;
+}
+
+function render(){
+  document.querySelectorAll('#filters button').forEach(b=>b.classList.toggle('on',b.dataset.f===filter));
+  let list = all;
+  if(filter==='active') list = all.filter(v=>v.is_active);
+  else if(filter==='inactive') list = all.filter(v=>!v.is_active);
+  else if(filter==='tested') list = all.filter(v=>(v.unique_titles||0)>=2);
+
+  document.getElementById('hint').textContent = `${list.length} video${list.length!==1?'s':''}`;
+
+  if(!list.length){
+    document.getElementById('rows').innerHTML = '';
+    const st = document.getElementById('state');
+    st.style.display='block'; st.className='empty';
+    st.textContent = filter==='tested' ? 'No active title experiments detected yet — they show up as videos accrue samples.' : 'Nothing here yet.';
+    return;
+  }
+  document.getElementById('state').style.display='none';
+
+  document.getElementById('rows').innerHTML = list.map(v=>{
+    const url = `https://youtube.com/watch?v=${v.video_id}`;
+    const thumb = `https://i.ytimg.com/vi/${v.video_id}/mqdefault.jpg`;
+    return `<tr>
+      <td><div class="vid">
+        <img class="thumb" loading="lazy" src="${thumb}" onerror="this.style.visibility='hidden'">
+        <div class="meta">
+          <div class="ch"><span class="sdot ${v.is_active?'on':'off'}" title="${v.is_active?'Active':'Inactive'}"></span>${esc(v.channel_name||'')}</div>
+          <a class="id" href="${url}" target="_blank" rel="noopener">${v.video_id}</a>
+        </div>
+      </div></td>
+      <td class="variants">${variantsCell(v)}</td>
+      <td>${statusBadge(v)}</td>
+      <td><span class="num">${v.total_samples||0}</span></td>
+      <td class="when">${fmt(v.published_at)}</td>
+    </tr>`;
+  }).join('');
+}
+
+function fmt(d){ if(!d) return '<span class="dash">—</span>';
+  return new Date(d).toLocaleDateString(undefined,{month:'short',day:'numeric'}); }
+function stamp(){ document.getElementById('updated').textContent = 'Updated '+new Date().toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit'}); }
+function esc(s){ return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function trunc(s,n){ return s.length>n ? s.slice(0,n-1)+'…' : s; }
+
+document.getElementById('filters').addEventListener('click',e=>{
+  if(e.target.dataset.f){ filter=e.target.dataset.f; render(); }
+});
+load();
+setInterval(load, 30000);
+</script>
 </body>
 </html>

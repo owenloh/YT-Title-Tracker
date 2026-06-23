@@ -7,7 +7,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from psycopg2.pool import SimpleConnectionPool
 
-from config import DATABASE_URL
+from config import DATABASE_URL, RATIO_WINDOW_DAYS
 
 # Connection pool (min 1, max 20 connections)
 _pool: Optional[SimpleConnectionPool] = None
@@ -261,6 +261,27 @@ def get_title_stats(video_id: str) -> List[Tuple[str, int]]:
         return_conn(conn)
 
 
+def get_recent_title_stats(video_id: str, days: int) -> List[Tuple[str, int]]:
+    """Title counts over the last `days` days only: [(title, count), ...] desc.
+
+    Used for the displayed A/B split so percentages reflect the experiment's
+    CURRENT ratio rather than a lifetime average (the split shifts over time).
+    """
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT title_text, COUNT(*) as count "
+                "FROM title_samples "
+                "WHERE video_id = %s AND sampled_at >= NOW() - make_interval(days => %s) "
+                "GROUP BY title_text ORDER BY count DESC",
+                (video_id, days),
+            )
+            return [(r["title_text"], r["count"]) for r in cur.fetchall()]
+    finally:
+        return_conn(conn)
+
+
 def get_total_samples(video_id: str) -> int:
     """Get total number of samples for a video."""
     conn = get_conn()
@@ -299,6 +320,21 @@ def set_comment_id(video_id: str, comment_id: str, status: str = None):
                 "UPDATE videos SET comment_id = %s, comment_posted_at = CURRENT_TIMESTAMP, comment_status = %s "
                 "WHERE video_id = %s",
                 (comment_id, status, video_id),
+            )
+        conn.commit()
+    finally:
+        return_conn(conn)
+
+
+def update_comment_status(video_id: str, status: str):
+    """Update just the moderation status of an existing comment (e.g. a
+    held comment that the channel later approved -> published)."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE videos SET comment_status = %s WHERE video_id = %s",
+                (status, video_id),
             )
         conn.commit()
     finally:
@@ -377,18 +413,19 @@ def update_last_checked(video_id: str):
 
 def get_active_videos() -> List[dict]:
     """Get all active videos for hourly checks.
-    
-    Only returns videos where is_active = TRUE (not stagnated).
+
+    Returns every active (non-stagnated, non-ignored) video -- including ones
+    without a comment yet -- so they keep accruing samples and can surface a 2nd
+    variant (and earn their first comment) over time, not just at startup.
     """
     conn = get_conn()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
                 "SELECT v.video_id, v.channel_id, c.display_name AS channel_name, "
-                "       v.published_at, v.comment_id "
+                "       v.published_at, v.comment_id, v.comment_status "
                 "FROM videos v JOIN channels c ON v.channel_id = c.channel_id "
                 "WHERE v.is_active = TRUE AND v.is_ignored = FALSE AND v.is_deleted = FALSE "
-                "      AND v.comment_id IS NOT NULL "
                 "ORDER BY v.published_at DESC"
             )
             return [dict(row) for row in cur.fetchall()]
@@ -516,24 +553,48 @@ def get_video_info(video_id: str) -> Optional[dict]:
 
 
 def get_all_videos_summary() -> List[dict]:
-    """Get summary of all videos (for stats calculation)."""
+    """Get summary of all videos for the dashboard.
+
+    Includes a `variants` array per video: [{title, count, recent}, ...] ordered
+    by all-time count, where `recent` is the count within the rolling window so
+    the UI can show the current split (matching the comment).
+    """
     conn = get_conn()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
                 """
+                WITH title_agg AS (
+                    SELECT video_id, title_text,
+                           COUNT(*) AS cnt,
+                           COUNT(*) FILTER (
+                               WHERE sampled_at >= NOW() - make_interval(days => %s)
+                           ) AS recent_cnt
+                    FROM title_samples
+                    GROUP BY video_id, title_text
+                )
                 SELECT v.video_id, v.channel_id, c.display_name as channel_name,
                        v.published_at, v.is_ignored, v.is_deleted, v.is_active,
                        v.comment_id, v.comment_status, v.comment_posted_at, v.comment_last_edited_at,
                        v.last_checked_at,
-                       COUNT(DISTINCT ts.title_text) as unique_titles,
-                       COUNT(ts.id) as total_samples
+                       COUNT(ta.title_text) as unique_titles,
+                       COALESCE(SUM(ta.cnt), 0) as total_samples,
+                       COALESCE(
+                           json_agg(
+                               json_build_object('title', ta.title_text,
+                                                 'count', ta.cnt,
+                                                 'recent', ta.recent_cnt)
+                               ORDER BY ta.cnt DESC
+                           ) FILTER (WHERE ta.title_text IS NOT NULL),
+                           '[]'
+                       ) as variants
                 FROM videos v
                 JOIN channels c ON v.channel_id = c.channel_id
-                LEFT JOIN title_samples ts ON v.video_id = ts.video_id
+                LEFT JOIN title_agg ta ON v.video_id = ta.video_id
                 GROUP BY v.video_id, c.display_name
                 ORDER BY v.published_at DESC
                 """,
+                (RATIO_WINDOW_DAYS,),
             )
             return [dict(row) for row in cur.fetchall()]
     finally:
