@@ -167,33 +167,52 @@ class TestRenderComment(unittest.TestCase):
         import main
         self.render = main.render_comment
 
-    def test_lists_variants_with_frequency(self):
+    def test_uses_recent_window_for_percentages(self):
+        # Lifetime is 50/50 but the recent window is 90/10 -> show the CURRENT split.
         out = self.render("INTRO",
-                          [(date(2026, 2, 7), ["Common", "Rare"])],
-                          [("Common", 90), ("Rare", 10)])
+                          [("A", 90), ("B", 10)],            # recent window
+                          [("A", 500), ("B", 500)],          # all-time (50/50)
+                          [(date(2026, 2, 7), ["A", "B"])],
+                          3)
         self.assertTrue(out.startswith("INTRO"))
-        self.assertIn("Common", out)
-        self.assertIn("Rare", out)
-        self.assertIn("~90%", out)              # observed frequency shown
+        self.assertIn("~90%", out)
         self.assertIn("~10%", out)
-        self.assertIn("Feb 07", out)            # first-spotted date from history
+        self.assertIn("last 3 days", out)        # window is labelled
+        self.assertIn("Feb 07", out)             # first-spotted date
 
     def test_variants_sorted_by_frequency(self):
-        # input order shouldn't matter; the dominant title is listed first
-        out = self.render("INTRO", [], [("Rare", 2), ("Common", 98)])
+        out = self.render("INTRO", [("Rare", 2), ("Common", 98)],
+                          [("Rare", 2), ("Common", 98)], [], 3)
         self.assertLess(out.index("Common"), out.index("Rare"))
 
+    def test_retired_titles_listed_separately(self):
+        # "Old" was tested historically but not in the recent window.
+        out = self.render("INTRO",
+                          [("A", 80), ("B", 20)],
+                          [("A", 100), ("B", 40), ("Old", 30)],
+                          [(date(2026, 2, 7), ["A", "B", "Old"])],
+                          3)
+        self.assertIn("Earlier also tested", out)
+        self.assertIn("Old", out)
+
+    def test_falls_back_to_all_time_when_window_empty(self):
+        out = self.render("INTRO", [], [("A", 30), ("B", 10)],
+                          [(date(2026, 2, 7), ["A", "B"])], 3)
+        self.assertIn("A", out)
+        self.assertIn("B", out)
+        self.assertNotIn("last 3 days", out)     # no window claim when falling back
+
     def test_single_title_makes_no_ab_claim(self):
-        out = self.render("INTRO", [], [("Only Title", 9)])
+        out = self.render("INTRO", [("Only Title", 9)], [("Only Title", 40)], [], 3)
         self.assertIn("Only one title observed so far: Only Title", out)
 
     def test_caps_to_six_variants(self):
         stats = [(f"T{i}", 20 - i) for i in range(8)]
-        out = self.render("INTRO", [], stats)
-        self.assertIn("2 more", out)            # 8 variants -> shows 6 + "and 2 more"
+        out = self.render("INTRO", stats, stats, [], 3)
+        self.assertIn("2 more", out)             # 8 variants -> 6 shown + "and 2 more"
 
     def test_empty(self):
-        self.assertEqual(self.render("INTRO", [], []), "INTRO")
+        self.assertEqual(self.render("INTRO", [], [], [], 3), "INTRO")
 
 
 class TestChannelIdDetection(unittest.TestCase):

@@ -17,6 +17,7 @@ from config import (
     FAST_SAMPLES,
     INACTIVE_DAYS_THRESHOLD,
     NEW_VIDEO_CHECK_INTERVAL,
+    RATIO_WINDOW_DAYS,
     SAMPLES_PER_RUN,
     SKIP_COMMENT,
 )
@@ -28,6 +29,7 @@ from storage import (
     get_active_videos,
     get_comment_id,
     get_known_video_ids_for_channel,
+    get_recent_title_stats,
     get_title_history_by_date,
     get_title_stats,
     get_total_samples,
@@ -38,10 +40,11 @@ from storage import (
     mark_video_inactive,
     set_comment_id,
     update_comment_edited,
+    update_comment_status,
     update_last_checked,
     update_title_history,
 )
-from youtube_comment import post_comment, update_comment
+from youtube_comment import fetch_comment_status, post_comment, update_comment
 
 # Thread pool for background processing
 executor = ThreadPoolExecutor(max_workers=10)
@@ -68,44 +71,37 @@ def reprocess_videos_without_comments():
 _MAX_VARIANTS_SHOWN = 6
 
 
-def render_comment(intro: str, history: list, stats: list) -> str:
+def render_comment(intro: str, recent_stats: list, all_time_stats: list,
+                   history: list, window_days: int) -> str:
     """Pure comment formatter (no DB) so it can be unit tested.
 
-    history: [(date, [titles]), ...]   stats: [(title, count), ...]
+    recent_stats:   [(title, count), ...] within the rolling window (current split)
+    all_time_stats: [(title, count), ...] over all samples (which titles exist)
+    history:        [(date, [titles]), ...]   window_days: int
 
-    Lists each title variant with how often we observed it, so a viewer
-    immediately understands "different people are shown different titles". Full
-    titles are kept on their own line (no mid-word truncation), and the observed
-    frequency is the most convincing signal so it leads each line.
+    The displayed percentages come from the RECENT window so they reflect the
+    experiment's current ratio, not a lifetime blend. Titles seen earlier but not
+    in the window are listed separately ("Earlier also tested"). Full titles stay
+    on their own line (no mid-word truncation).
     """
-    # stats carries observed counts (preferred); fall back to history's titles.
-    variants = list(stats)
-    if not variants and history:
-        seen = []
-        for _, titles in history:
-            for t in titles:
-                if t not in seen:
-                    seen.append(t)
-        variants = [(t, 0) for t in seen]
-
-    if not variants:
+    all_titles = [t for t, _ in all_time_stats]
+    if not all_titles:
         return intro
+    if len(all_titles) == 1:
+        # Not an A/B test we can demonstrate (we don't post until >= 2 anyway).
+        return f"{intro}\n\nOnly one title observed so far: {all_titles[0]}"
 
-    if len(variants) == 1:
-        # A single title is not an A/B test we can demonstrate -- render honestly
-        # (in practice we don't post until >= 2 variants are seen).
-        return f"{intro}\n\nOnly one title observed so far: {variants[0][0]}"
+    # Current split: the recent window; fall back to all-time if the window is
+    # empty (e.g. the video stopped being sampled).
+    using_window = bool(recent_stats)
+    basis = recent_stats if using_window else all_time_stats
+    ordered = sorted(basis, key=lambda x: x[1], reverse=True)
+    total = sum(count for _, count in ordered)
 
-    total = sum(count for _, count in variants)
-    ordered = sorted(variants, key=lambda x: x[1], reverse=True)
-
-    lines = [
-        intro,
-        "",
-        "Each viewer is shown just one of these while YouTube measures which gets "
-        "the most clicks. The variants I've caught so far:",
-        "",
-    ]
+    lead = (f"Each viewer is shown just one of these — here's the split over the "
+            f"last {window_days} days:") if using_window else \
+           "Each viewer is shown just one of these — the titles I've caught:"
+    lines = [intro, "", lead, ""]
     for i, (title, count) in enumerate(ordered[:_MAX_VARIANTS_SHOWN], 1):
         if total:
             pct = max(1, round(100 * count / total))
@@ -115,6 +111,15 @@ def render_comment(intro: str, history: list, stats: list) -> str:
     extra = len(ordered) - _MAX_VARIANTS_SHOWN
     if extra > 0:
         lines.append(f"…and {extra} more")
+
+    # Titles seen historically but not in the current window.
+    shown = {t for t, _ in ordered}
+    retired = [t for t in all_titles if t not in shown]
+    if retired:
+        rstr = ", ".join(f"“{t}”" for t in retired[:3])
+        if len(retired) > 3:
+            rstr += f" +{len(retired) - 3} more"
+        lines += ["", f"Earlier also tested: {rstr}"]
 
     first_date = min((d for d, _ in history), default=None) if history else None
     lines.append("")
@@ -139,9 +144,13 @@ def _intro_for(video_id: str) -> str:
 
 def build_comment_text(video_id: str) -> str:
     """Build comment text from this video's stored title history."""
-    return render_comment(_intro_for(video_id),
-                          get_title_history_by_date(video_id),
-                          get_title_stats(video_id))
+    return render_comment(
+        _intro_for(video_id),
+        get_recent_title_stats(video_id, RATIO_WINDOW_DAYS),
+        get_title_stats(video_id),
+        get_title_history_by_date(video_id),
+        RATIO_WINDOW_DAYS,
+    )
 
 
 def _distinct_titles(video_id: str) -> frozenset:
@@ -418,6 +427,13 @@ def check_active_videos():
                 continue
             _record_samples(video_id, titles)
             _ensure_comment(video_id, channel_name, before)
+
+            # A held comment may have been approved since we posted it -> refresh.
+            if video_info.get("comment_id") and video_info.get("comment_status") == "heldForReview":
+                fresh = fetch_comment_status(video_info["comment_id"])
+                if fresh and fresh != "heldForReview":
+                    update_comment_status(video_id, fresh)
+                    print(f"[{channel_name}] {video_id} comment now {fresh}", flush=True)
 
         except Exception as e:
             print(f"Error checking video {video_id}: {e}", file=sys.stderr)
