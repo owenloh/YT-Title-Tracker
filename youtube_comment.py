@@ -108,11 +108,12 @@ def update_comment(comment_id: str, text: str) -> bool:
         return False
 
 
-def fetch_comment_status(comment_id: str):
-    """Re-read a comment's current moderation status (cheap, 1 quota unit).
+def fetch_comment_meta(comment_id: str):
+    """Re-read a comment's status + engagement in one call (1 quota unit).
 
-    Lets a 'heldForReview' comment flip to 'published' once the channel approves
-    it. Returns a normalized status, or None if it can't be read.
+    Returns {'status', 'likes', 'replies'} or None. Lets a 'heldForReview'
+    comment flip to 'published' once approved, and tracks likes/replies as a
+    virality signal.
     """
     creds = get_credentials()
     if not creds:
@@ -124,7 +125,11 @@ def fetch_comment_status(comment_id: str):
         if not items:
             return None
         snippet = items[0]["snippet"]
-        raw = snippet["topLevelComment"]["snippet"].get("moderationStatus")
-        return _normalize_status(raw, snippet.get("isPublic"))
+        top = snippet["topLevelComment"]["snippet"]
+        return {
+            "status": _normalize_status(top.get("moderationStatus"), snippet.get("isPublic")),
+            "likes": int(top.get("likeCount", 0) or 0),
+            "replies": int(snippet.get("totalReplyCount", 0) or 0),
+        }
     except Exception:
         return None

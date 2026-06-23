@@ -13,6 +13,7 @@ from config import (
     ACTIVE_VIDEO_CHECK_INTERVAL,
     CHANNELS,
     COMMENT_INTROS,
+    COMMENT_REFRESH_HOURS,
     CUTOFF_DATE,
     FAST_SAMPLES,
     INACTIVE_DAYS_THRESHOLD,
@@ -28,6 +29,7 @@ from storage import (
     add_video,
     get_active_videos,
     get_comment_id,
+    get_comment_state,
     get_known_video_ids_for_channel,
     get_recent_title_stats,
     get_title_history_by_date,
@@ -40,11 +42,11 @@ from storage import (
     mark_video_inactive,
     set_comment_id,
     update_comment_edited,
-    update_comment_status,
+    update_comment_meta,
     update_last_checked,
     update_title_history,
 )
-from youtube_comment import fetch_comment_status, post_comment, update_comment
+from youtube_comment import fetch_comment_meta, post_comment, update_comment
 
 # Thread pool for background processing
 executor = ThreadPoolExecutor(max_workers=10)
@@ -159,23 +161,27 @@ def _distinct_titles(video_id: str) -> frozenset:
 
 
 def _maybe_update_comment(video_id: str, channel_name: str, before_titles) -> None:
-    """Re-edit the comment only when a NEW title variant has appeared.
+    """Re-edit the comment when its rendered text actually changed.
 
-    We compare the SET of distinct titles (not the rendered text) so the comment
-    isn't rewritten just because observed percentages drifted a little -- that
-    would burn YouTube API quota (50 units/edit) for no real change. Passing
-    before_titles=None forces an update.
+    A NEW title variant updates immediately (timely). Percentage-only drift also
+    updates -- so the displayed split stays current -- but is rate-limited to once
+    per COMMENT_REFRESH_HOURS so we don't re-edit every hour (quota / "edited"
+    spam). Identical text never triggers an edit.
     """
     if SKIP_COMMENT:
         return
-    comment_id = get_comment_id(video_id)
-    if not comment_id:
+    state = get_comment_state(video_id, COMMENT_REFRESH_HOURS)
+    if not state or not state["comment_id"]:
         return
-    if before_titles is not None and _distinct_titles(video_id) == before_titles:
-        return
+    new_text = build_comment_text(video_id)
+    if new_text == state["comment_text"]:
+        return  # nothing visibly changed
+    set_changed = before_titles is None or _distinct_titles(video_id) != before_titles
+    if not set_changed and not state["refresh_due"]:
+        return  # only % drift, and we refreshed recently -> wait
     try:
-        if update_comment(comment_id, build_comment_text(video_id)):
-            update_comment_edited(video_id)
+        if update_comment(state["comment_id"], new_text):
+            update_comment_edited(video_id, new_text)
             print(f"[{channel_name}] Updated comment for {video_id}", flush=True)
     except Exception:
         # 404/403 -> comment was deleted by the uploader; stop tracking it.
@@ -198,9 +204,10 @@ def _ensure_comment(video_id: str, channel_name: str, before_titles=None) -> Non
         return
     if len(_distinct_titles(video_id)) < 2:
         return  # not enough evidence yet -- wait for more samples to accrue
-    new_id, status = post_comment(video_id, build_comment_text(video_id))
+    text = build_comment_text(video_id)
+    new_id, status = post_comment(video_id, text)
     if new_id:
-        set_comment_id(video_id, new_id, status)
+        set_comment_id(video_id, new_id, status, text)
         print(f"[{channel_name}] Comment posted for {video_id} (status: {status})", flush=True)
     elif status == "quota_exceeded":
         print(f"[{channel_name}] Quota exceeded - no comment for {video_id}", flush=True)
@@ -428,12 +435,13 @@ def check_active_videos():
             _record_samples(video_id, titles)
             _ensure_comment(video_id, channel_name, before)
 
-            # A held comment may have been approved since we posted it -> refresh.
-            if video_info.get("comment_id") and video_info.get("comment_status") == "heldForReview":
-                fresh = fetch_comment_status(video_info["comment_id"])
-                if fresh and fresh != "heldForReview":
-                    update_comment_status(video_id, fresh)
-                    print(f"[{channel_name}] {video_id} comment now {fresh}", flush=True)
+            # Refresh the comment's moderation status + engagement (likes/replies)
+            # so the dashboard shows current virality and held->published flips.
+            cid = get_comment_id(video_id)
+            if cid:
+                meta = fetch_comment_meta(cid)
+                if meta:
+                    update_comment_meta(video_id, meta["status"], meta["likes"], meta["replies"])
 
         except Exception as e:
             print(f"Error checking video {video_id}: {e}", file=sys.stderr)

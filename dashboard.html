@@ -105,6 +105,10 @@
   .cmt a{font-size:12px;color:var(--accent);text-decoration:none;font-weight:600}
   .cmt a:hover{text-decoration:underline}
   .num{font-variant-numeric:tabular-nums;font-weight:600}
+  .eng{display:inline-flex;align-items:center;gap:5px;font-size:13px;color:var(--faint);font-variant-numeric:tabular-nums;white-space:nowrap}
+  .eng b{font-weight:650;color:var(--muted)}
+  .eng.on b{color:var(--ink)}
+  .eng.like.on{color:#e0245e} .eng.reply.on{color:var(--accent)}
   .when{color:var(--muted);white-space:nowrap}
   .dash{color:var(--faint)}
 
@@ -148,6 +152,8 @@
             <th>Video</th>
             <th>Title variants <span id="splitlbl"></span></th>
             <th>Comment</th>
+            <th>Likes</th>
+            <th>Replies</th>
             <th>Samples</th>
             <th>Published</th>
           </tr>
@@ -265,12 +271,21 @@ function render(){
       </div></td>
       <td class="variants">${variantsCell(v)}</td>
       <td>${statusBadge(v)}</td>
+      <td>${engage(v,'like')}</td>
+      <td>${engage(v,'reply')}</td>
       <td><span class="num">${v.total_samples||0}</span></td>
       <td class="when">${fmt(v.published_at)}</td>
     </tr>`;
   }).join('');
 }
 
+function engage(v, kind){
+  if(!v.comment_id) return '<span class="dash">—</span>';
+  const n = kind==='like' ? (v.comment_like_count||0) : (v.comment_reply_count||0);
+  const icon = kind==='like' ? '♥' : '↳';
+  const cls = 'eng '+kind+(n>0?' on':'');
+  return `<span class="${cls}">${icon}<b>${n}</b></span>`;
+}
 function fmt(d){ if(!d) return '<span class="dash">—</span>';
   return new Date(d).toLocaleDateString(undefined,{month:'short',day:'numeric'}); }
 function stamp(){ document.getElementById('updated').textContent = 'Updated '+new Date().toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit'}); }

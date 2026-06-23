@@ -54,6 +54,12 @@ FAST_SAMPLES = int(os.environ.get("FAST_SAMPLES", "15"))  # Quick samples before
 # ends tests). Distinct-variant detection still uses all-time samples.
 RATIO_WINDOW_DAYS = int(os.environ.get("RATIO_WINDOW_DAYS", "3"))
 
+# A comment is re-edited immediately when a new title variant appears, but for
+# percentage-only drift we rate-limit re-edits to at most once per this many
+# hours (keeps the displayed split current without burning API quota / spamming
+# the "edited" marker every hour).
+COMMENT_REFRESH_HOURS = int(os.environ.get("COMMENT_REFRESH_HOURS", "12"))
+
 # Active/non-active logic: non-active if N days straight same single title
 INACTIVE_DAYS_THRESHOLD = int(os.environ.get("INACTIVE_DAYS_THRESHOLD", "5"))
 

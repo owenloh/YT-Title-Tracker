@@ -144,6 +144,15 @@ def init_db():
                     END IF;
                 END $$;
             """)
+
+            # Migration: store the rendered comment text (to detect real changes
+            # before re-editing) and engagement counts (likes/replies = virality).
+            cur.execute("""
+                ALTER TABLE videos
+                    ADD COLUMN IF NOT EXISTS comment_text TEXT,
+                    ADD COLUMN IF NOT EXISTS comment_like_count INTEGER DEFAULT 0,
+                    ADD COLUMN IF NOT EXISTS comment_reply_count INTEGER DEFAULT 0;
+            """)
         conn.commit()
     finally:
         return_conn(conn)
@@ -311,44 +320,69 @@ def get_comment_id(video_id: str) -> Optional[str]:
         return_conn(conn)
 
 
-def set_comment_id(video_id: str, comment_id: str, status: str = None):
-    """Set comment ID and status for a video."""
+def set_comment_id(video_id: str, comment_id: str, status: str = None, text: str = None):
+    """Set comment ID, status, and the rendered text for a video."""
     conn = get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE videos SET comment_id = %s, comment_posted_at = CURRENT_TIMESTAMP, comment_status = %s "
+                "UPDATE videos SET comment_id = %s, comment_posted_at = CURRENT_TIMESTAMP, "
+                "comment_status = %s, comment_text = %s "
                 "WHERE video_id = %s",
-                (comment_id, status, video_id),
+                (comment_id, status, text, video_id),
             )
         conn.commit()
     finally:
         return_conn(conn)
 
 
-def update_comment_status(video_id: str, status: str):
-    """Update just the moderation status of an existing comment (e.g. a
-    held comment that the channel later approved -> published)."""
+def get_comment_state(video_id: str, refresh_hours: int) -> Optional[dict]:
+    """Return {comment_id, comment_text, refresh_due} for the comment refresh logic.
+
+    refresh_due is True when the last edit/post is older than refresh_hours, used
+    to rate-limit percentage-only refreshes so we don't re-edit every hour.
+    """
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT comment_id, comment_text, "
+                "  (COALESCE(comment_last_edited_at, comment_posted_at) IS NULL "
+                "   OR COALESCE(comment_last_edited_at, comment_posted_at) "
+                "      < NOW() - make_interval(hours => %s)) AS refresh_due "
+                "FROM videos WHERE video_id = %s",
+                (refresh_hours, video_id),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+    finally:
+        return_conn(conn)
+
+
+def update_comment_meta(video_id: str, status: str, likes: int, replies: int):
+    """Refresh a comment's moderation status and engagement counts (likes/replies)."""
     conn = get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE videos SET comment_status = %s WHERE video_id = %s",
-                (status, video_id),
+                "UPDATE videos SET comment_status = %s, comment_like_count = %s, "
+                "comment_reply_count = %s WHERE video_id = %s",
+                (status, likes, replies, video_id),
             )
         conn.commit()
     finally:
         return_conn(conn)
 
 
-def update_comment_edited(video_id: str):
-    """Mark comment as edited."""
+def update_comment_edited(video_id: str, text: str = None):
+    """Mark comment as edited and store its new rendered text."""
     conn = get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE videos SET comment_last_edited_at = CURRENT_TIMESTAMP WHERE video_id = %s",
-                (video_id,),
+                "UPDATE videos SET comment_last_edited_at = CURRENT_TIMESTAMP, "
+                "comment_text = COALESCE(%s, comment_text) WHERE video_id = %s",
+                (text, video_id),
             )
         conn.commit()
     finally:
@@ -576,6 +610,7 @@ def get_all_videos_summary() -> List[dict]:
                 SELECT v.video_id, v.channel_id, c.display_name as channel_name,
                        v.published_at, v.is_ignored, v.is_deleted, v.is_active,
                        v.comment_id, v.comment_status, v.comment_posted_at, v.comment_last_edited_at,
+                       v.comment_like_count, v.comment_reply_count,
                        v.last_checked_at,
                        COUNT(ta.title_text) as unique_titles,
                        COALESCE(SUM(ta.cnt), 0) as total_samples,
