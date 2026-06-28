@@ -105,6 +105,10 @@ Dashboard available at your Railway public URL.
 | `FAST_SAMPLES` | No | 5 | Quick samples before posting comment |
 | `INACTIVE_DAYS_THRESHOLD` | No | 5 | Days of same title = finalized |
 | `SKIP_COMMENT` | No | 0 | Set to 1 to disable commenting |
+| `ADMIN_TOKEN` | No | — | Secret to authorize admin endpoints (e.g. `/api/reset`). Unset = admin endpoints disabled |
+| `CORS_ORIGINS` | No | — | Comma-separated allowed origins for `/api/*`. Unset = same-origin only |
+| `RATE_LIMIT_PER_MINUTE` | No | 240 | Max requests per client IP per minute |
+| `RESET_RATE_LIMIT_PER_MINUTE` | No | 5 | Max `/api/reset` attempts per client IP per minute |
 
 ## Comment Format
 
@@ -120,10 +124,39 @@ Feb 09: New Test Title | Another Variant | Third Option
 
 ## API Endpoints
 
+Public (read-only — these power the dashboard website):
+
 - `GET /` - Dashboard
 - `GET /api/videos` - All videos with stats
+- `GET /api/video/<id>` - One video + title timeline
 - `GET /api/stats` - Summary counts
-- `POST /api/reset` - Clear database (use with caution)
+- `GET /api/health` - Health check
+
+Admin (requires the `ADMIN_TOKEN` secret):
+
+- `POST /api/reset` - Clear database. Send the token as `X-Admin-Token: <token>`
+  or `Authorization: Bearer <token>`. **Disabled** (returns 503) when
+  `ADMIN_TOKEN` is unset, so it can never be triggered anonymously.
+
+  ```bash
+  curl -X POST https://your-app.up.railway.app/api/reset \
+       -H "X-Admin-Token: $ADMIN_TOKEN"
+  ```
+
+### HTTP hardening
+
+All endpoints share these protections (the public site keeps working unchanged):
+
+- State-changing endpoints require `ADMIN_TOKEN` (constant-time compared); they
+  fail closed when no token is configured.
+- Security headers on every response: `Content-Security-Policy`,
+  `Strict-Transport-Security`, `X-Content-Type-Options: nosniff`,
+  `X-Frame-Options: DENY`, `Referrer-Policy`, `Permissions-Policy`.
+- Per-client rate limiting (`RATE_LIMIT_PER_MINUTE`, tighter on `/api/reset`).
+- Error responses are generic — internal exceptions are logged, never returned.
+- CORS is same-origin only unless `CORS_ORIGINS` is set.
+- Path params validated; request bodies capped at 64 KB; runs behind Railway's
+  proxy via `ProxyFix` so rate limits see the real client IP.
 
 ## How It Works
 

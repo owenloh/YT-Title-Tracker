@@ -1,23 +1,162 @@
-"""Flask API for dashboard - health and status tracking."""
+"""Flask API for dashboard - health and status tracking.
+
+Security model
+--------------
+The dashboard at ``/`` and the read-only ``GET /api/*`` endpoints it calls are
+public (they only expose already-public YouTube title data), so the site keeps
+working with no credentials. Everything that can *change* state -- currently the
+destructive ``POST /api/reset`` -- requires an admin token and is disabled unless
+one is configured. On top of that every response carries hardening headers,
+requests are rate limited per client, error bodies are generic (no internal
+detail leaks), CORS is locked down by default, and request bodies are capped.
+"""
+import functools
+import hmac
 import logging
+import os
+import re
+import threading
+import time
+from collections import defaultdict, deque
 from datetime import datetime, date
-from flask import Flask, jsonify, send_file
+
+from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 from storage import get_all_videos_summary, get_title_daily_counts, get_video_info, init_db
 
 app = Flask(__name__)
-CORS(app)  # Allow frontend to call from any origin
+
+# Trust one layer of Railway's reverse proxy so request.remote_addr / scheme
+# reflect the real client instead of the proxy. Keep this at 1 hop -- trusting
+# more lets clients spoof X-Forwarded-For.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+
+# Cap request bodies (none of our endpoints need a payload) to blunt memory abuse.
+app.config["MAX_CONTENT_LENGTH"] = 64 * 1024  # 64 KB
+
+# ---------------------------------------------------------------------------
+# Configuration (from environment)
+# ---------------------------------------------------------------------------
+
+# Shared secret required to call state-changing/admin endpoints (e.g. /api/reset).
+# If unset, those endpoints are DISABLED (fail closed) rather than left open.
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "").strip()
+
+# Cross-origin access. Empty (default) => same-origin only: the dashboard is
+# served from this same host so it keeps working, while other sites can't read
+# the API from a browser. Set to a comma-separated origin list, or "*", to open.
+_cors_origins = [o.strip() for o in os.environ.get("CORS_ORIGINS", "").split(",") if o.strip()]
+if _cors_origins:
+    CORS(app, resources={r"/api/*": {"origins": _cors_origins}})
+
+# Per-client rate limits (requests per 60s window).
+RATE_LIMIT_PER_MINUTE = int(os.environ.get("RATE_LIMIT_PER_MINUTE", "240"))
+RESET_RATE_LIMIT_PER_MINUTE = int(os.environ.get("RESET_RATE_LIMIT_PER_MINUTE", "5"))
+
+# Plausible YouTube video id (validate path params before touching the DB).
+_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,20}$")
 
 # Disable Flask request logging (clutters Railway logs)
-log = logging.getLogger('werkzeug')
-log.setLevel(logging.ERROR)
+logging.getLogger("werkzeug").setLevel(logging.ERROR)
+logger = logging.getLogger(__name__)
 
 
-@app.route("/", methods=["GET"])
-def dashboard():
-    """Serve the dashboard HTML."""
-    return send_file("dashboard.html")
+# ---------------------------------------------------------------------------
+# Rate limiting (in-process sliding window; app runs as a single process)
+# ---------------------------------------------------------------------------
+_rate_lock = threading.Lock()
+_rate_buckets: dict[str, deque] = defaultdict(deque)
+
+
+def _client_ip() -> str:
+    """Best-effort client IP. ProxyFix has already normalized remote_addr from
+    the trusted proxy's X-Forwarded-For, so prefer it."""
+    return request.remote_addr or "unknown"
+
+
+def _rate_limited(key: str, limit: int, window: int = 60) -> bool:
+    """Record a hit for ``key`` and report whether it now exceeds ``limit``."""
+    now = time.time()
+    cutoff = now - window
+    with _rate_lock:
+        dq = _rate_buckets[key]
+        while dq and dq[0] < cutoff:
+            dq.popleft()
+        if len(dq) >= limit:
+            return True
+        dq.append(now)
+        if not dq:
+            _rate_buckets.pop(key, None)
+        return False
+
+
+@app.before_request
+def _enforce_rate_limit():
+    ip = _client_ip()
+    # Tighter budget specifically for the destructive admin endpoint.
+    if request.path == "/api/reset" and _rate_limited(
+        f"reset:{ip}", RESET_RATE_LIMIT_PER_MINUTE
+    ):
+        return jsonify({"error": "rate limit exceeded"}), 429
+    if _rate_limited(f"all:{ip}", RATE_LIMIT_PER_MINUTE):
+        return jsonify({"error": "rate limit exceeded"}), 429
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Security headers
+# ---------------------------------------------------------------------------
+@app.after_request
+def _security_headers(resp):
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+    # Railway serves over HTTPS; ask browsers to stick to it.
+    resp.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    # The dashboard uses inline <style>/<script> and loads YouTube thumbnails.
+    resp.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' https://i.ytimg.com data:; "
+        "connect-src 'self'; "
+        "base-uri 'self'; "
+        "form-action 'self'; "
+        "frame-ancestors 'none'"
+    )
+    return resp
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def require_admin(fn):
+    """Guard state-changing endpoints with a shared admin token.
+
+    Fails closed: if ADMIN_TOKEN isn't configured the endpoint is unavailable.
+    Token may be sent as ``X-Admin-Token: <token>`` or ``Authorization: Bearer <token>``.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not ADMIN_TOKEN:
+            logger.warning("Admin endpoint %s blocked: ADMIN_TOKEN not configured", request.path)
+            return jsonify({"error": "admin endpoints are disabled"}), 503
+        provided = request.headers.get("X-Admin-Token", "")
+        if not provided:
+            auth = request.headers.get("Authorization", "")
+            if auth.lower().startswith("bearer "):
+                provided = auth[7:].strip()
+        # Constant-time compare to avoid leaking the token via timing.
+        if not provided or not hmac.compare_digest(provided, ADMIN_TOKEN):
+            logger.warning("Unauthorized admin attempt on %s from %s", request.path, _client_ip())
+            return jsonify({"error": "unauthorized"}), 401
+        return fn(*args, **kwargs)
+
+    return wrapper
 
 
 def serialize_value(value):
@@ -27,9 +166,25 @@ def serialize_value(value):
     return value
 
 
+def _server_error(exc):
+    """Log the real error, return a generic message (no internal detail leak)."""
+    logger.exception("Request to %s failed: %s", request.path, exc)
+    return jsonify({"error": "internal server error"}), 500
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+@app.route("/", methods=["GET"])
+def dashboard():
+    """Serve the dashboard HTML."""
+    return send_file("dashboard.html")
+
+
 @app.route("/api/reset", methods=["POST"])
+@require_admin
 def reset_database():
-    """Clear all data from database. Use with caution!"""
+    """Clear all data from database. Admin-only; use with caution!"""
     try:
         from storage import get_conn, get_pool
         conn = get_conn()
@@ -41,9 +196,10 @@ def reset_database():
         conn.commit()
         cur.close()
         get_pool().putconn(conn)
+        logger.warning("Database reset performed by admin from %s", _client_ip())
         return jsonify({"status": "ok", "message": "Database cleared"})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _server_error(e)
 
 
 @app.route("/api/health", methods=["GET"])
@@ -62,17 +218,19 @@ def get_videos():
                 video[key] = serialize_value(value)
         return jsonify({"videos": videos})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _server_error(e)
 
 
 @app.route("/api/video/<video_id>", methods=["GET"])
 def get_video(video_id: str):
     """Get detailed info for a specific video."""
+    if not _VIDEO_ID_RE.match(video_id):
+        return jsonify({"error": "invalid video id"}), 400
     try:
         video = get_video_info(video_id)
         if not video:
             return jsonify({"error": "Video not found"}), 404
-        
+
         # Convert datetime/date objects
         for key, value in video.items():
             video[key] = serialize_value(value)
@@ -84,7 +242,7 @@ def get_video(video_id: str):
 
         return jsonify({"video": video, "timeline": timeline})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _server_error(e)
 
 
 @app.route("/api/stats", methods=["GET"])
@@ -92,12 +250,12 @@ def get_stats():
     """Get overall statistics."""
     try:
         all_videos = get_all_videos_summary()
-        
+
         # Active = is_active=TRUE (being tracked, shown in dashboard)
         # Inactive = is_active=FALSE (reference points / stagnated)
         active = [v for v in all_videos if v.get("is_active")]
         inactive = [v for v in all_videos if not v.get("is_active")]
-        
+
         from config import RATIO_WINDOW_DAYS
         return jsonify({
             "active_videos": len(active),
@@ -108,7 +266,30 @@ def get_stats():
             "ratio_window_days": RATIO_WINDOW_DAYS,
         })
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _server_error(e)
+
+
+# ---------------------------------------------------------------------------
+# Generic JSON error handlers (avoid leaking stack traces / HTML)
+# ---------------------------------------------------------------------------
+@app.errorhandler(404)
+def _not_found(_e):
+    return jsonify({"error": "not found"}), 404
+
+
+@app.errorhandler(405)
+def _method_not_allowed(_e):
+    return jsonify({"error": "method not allowed"}), 405
+
+
+@app.errorhandler(413)
+def _too_large(_e):
+    return jsonify({"error": "request too large"}), 413
+
+
+@app.errorhandler(500)
+def _internal(_e):
+    return jsonify({"error": "internal server error"}), 500
 
 
 if __name__ == "__main__":
