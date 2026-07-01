@@ -206,6 +206,17 @@ def _get_videos_from_channel_page(handle: str, max_videos: int = 15) -> List[Tup
         return []
 
 
+def resolve_channel_id(handle_or_id: str, expected_name: str = None) -> Optional[str]:
+    """Resolve an @handle or raw channel ID to a canonical UC... channel ID.
+
+    Used by the admin "add channel" flow so the DB always stores the stable
+    channel ID rather than a handle that could be reassigned.
+    """
+    if _looks_like_channel_id(handle_or_id):
+        return handle_or_id.strip()
+    return _resolve_handle_to_channel_id(handle_or_id, expected_name)
+
+
 def get_videos_from_rss(handle: str, expected_name: str = None, max_videos: int = 50) -> List[Tuple[str, datetime]]:
     """
     Get videos from channel using @handle format.

@@ -24,7 +24,17 @@ from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-from storage import get_all_videos_summary, get_title_daily_counts, get_video_info, init_db
+from config import parse_channels_str
+from scraper import resolve_channel_id
+from storage import (
+    add_channel_admin,
+    get_all_videos_summary,
+    get_channels_with_metrics,
+    get_title_daily_counts,
+    get_video_info,
+    init_db,
+    set_channel_enabled,
+)
 
 app = Flask(__name__)
 
@@ -181,6 +191,14 @@ def dashboard():
     return send_file("dashboard.html")
 
 
+@app.route("/admin", methods=["GET"])
+def admin_page():
+    """Serve the admin shell (channel management). The page itself is a static
+    file with no data in it -- every API call it makes is gated by ADMIN_TOKEN,
+    so serving the shell publicly leaks nothing."""
+    return send_file("admin.html")
+
+
 @app.route("/api/reset", methods=["POST"])
 @require_admin
 def reset_database():
@@ -198,6 +216,102 @@ def reset_database():
         get_pool().putconn(conn)
         logger.warning("Database reset performed by admin from %s", _client_ip())
         return jsonify({"status": "ok", "message": "Database cleared"})
+    except Exception as e:
+        return _server_error(e)
+
+
+@app.route("/api/admin/channels", methods=["GET"])
+@require_admin
+def list_channels():
+    """List all channels with metrics (videos tracked, comments posted,
+    comments/month, avg likes+replies per comment) for the admin UI's
+    include/exclude decision."""
+    try:
+        channels = get_channels_with_metrics()
+        for ch in channels:
+            for key, value in ch.items():
+                ch[key] = serialize_value(value)
+        return jsonify({"channels": channels})
+    except Exception as e:
+        return _server_error(e)
+
+
+@app.route("/api/admin/channels", methods=["POST"])
+@require_admin
+def add_channel():
+    """Add a single channel by @handle or channel ID.
+
+    The identifier is stored AS GIVEN (the handle), exactly like the
+    YOUTUBE_CHANNELS env seed does -- so adding a channel that's already tracked
+    via env is a harmless no-op on the same primary key, never a duplicate row.
+    We still resolve it once up front purely to validate it's a real channel and
+    give immediate feedback on a typo. track_from_date defaults to today, so the
+    channel only ever tracks videos published from today onward (no backfill)."""
+    body = request.get_json(silent=True) or {}
+    handle = str(body.get("handle") or "").strip()
+    display_name = str(body.get("display_name") or "").strip() or handle
+    if not handle:
+        return jsonify({"error": "handle is required"}), 400
+
+    try:
+        if resolve_channel_id(handle, expected_name=display_name or None) is None:
+            return jsonify({"error": f"could not resolve '{handle}' to a channel"}), 422
+
+        created = add_channel_admin(handle, display_name)
+        return jsonify({"status": "ok", "channel_id": handle, "created": created})
+    except Exception as e:
+        return _server_error(e)
+
+
+@app.route("/api/admin/channels/bulk", methods=["POST"])
+@require_admin
+def add_channels_bulk():
+    """Bulk-add channels from a comma-separated '@handle:Display Name' list
+    (same format as the YOUTUBE_CHANNELS env var).
+
+    Identifiers are stored as given (handles), matching the env seed, so this is
+    just a fast batch of idempotent inserts -- already-tracked channels collide
+    on their primary key and are left untouched (history preserved), new ones get
+    track_from_date = today. No per-channel network calls, so it returns quickly;
+    each new channel is picked up on the next new-video poll."""
+    body = request.get_json(silent=True) or {}
+    raw = str(body.get("list") or "")
+    entries = parse_channels_str(raw)
+    if not entries:
+        return jsonify({"error": "no channels found in list"}), 400
+
+    added = 0
+    try:
+        for handle, display_name in entries:
+            if add_channel_admin(handle, display_name):
+                added += 1
+        return jsonify({"status": "ok", "submitted": len(entries), "new": added})
+    except Exception as e:
+        return _server_error(e)
+
+
+# channel_id here is the stored identifier, which is normally an @handle (e.g.
+# "@MrBeast") or a raw UC id -- so the '@' and '.' that handles allow must pass.
+_CHANNEL_ID_ADMIN_RE = re.compile(r"^@?[A-Za-z0-9_.-]{1,100}$")
+
+
+@app.route("/api/admin/channels/<channel_id>", methods=["PATCH"])
+@require_admin
+def update_channel(channel_id: str):
+    """Enable or disable a channel. Enabling (incl. resuming after a pause) bumps
+    the channel's track_from_date to today via set_channel_enabled, so its whole
+    pause-window backlog is skipped by the date gate and only uploads from the
+    resume day onward are ever tracked -- no backfill."""
+    if not _CHANNEL_ID_ADMIN_RE.match(channel_id):
+        return jsonify({"error": "invalid channel id"}), 400
+    body = request.get_json(silent=True) or {}
+    if "enabled" not in body:
+        return jsonify({"error": "enabled is required"}), 400
+    enabled = bool(body["enabled"])
+
+    try:
+        set_channel_enabled(channel_id, enabled)
+        return jsonify({"status": "ok"})
     except Exception as e:
         return _server_error(e)
 
