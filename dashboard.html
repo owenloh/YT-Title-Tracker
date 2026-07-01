@@ -158,9 +158,9 @@
 
   <div class="toolbar">
     <div class="seg" id="filters">
-      <button data-f="active" class="on">Active</button>
-      <button data-f="tested">Being tested</button>
-      <button data-f="inactive">Inactive</button>
+      <button data-f="active-tests" class="on">Active tests</button>
+      <button data-f="inactive-tests">Inactive tests</button>
+      <button data-f="active">Active</button>
       <button data-f="all">All</button>
     </div>
     <div class="hint" id="hint"></div>
@@ -191,7 +191,7 @@
 
 <script>
 const VC = ['var(--v0)','var(--v1)','var(--v2)','var(--v3)','var(--v4)','var(--v5)'];
-let all = [], filter = 'active', windowDays = 3;
+let all = [], filter = 'active-tests', windowDays = 3;
 const expanded = new Set();      // video_ids with the history timeline open
 const timelineCache = {};        // video_id -> timeline rows
 
@@ -215,7 +215,7 @@ async function load(){
 function renderStats(s){
   const cards = [
     {label:'🎯 Active', value:s.active_videos||0, accent:false},
-    {label:'🔬 Being tested', value:s.multi_title||0, accent:true, sub:'2+ titles'},
+    {label:'🔬 Active tests', value:s.multi_title||0, accent:true, sub:'2+ titles'},
     {label:'💬 Comments', value:s.with_comments||0, accent:false},
     {label:'📊 Total tracked', value:s.total_in_db||0, accent:false},
   ];
@@ -267,9 +267,13 @@ function variantsCell(v){
 function render(){
   document.querySelectorAll('#filters button').forEach(b=>b.classList.toggle('on',b.dataset.f===filter));
   let list = all;
-  if(filter==='active') list = all.filter(v=>v.is_active);
-  else if(filter==='inactive') list = all.filter(v=>!v.is_active);
-  else if(filter==='tested') list = all.filter(v=>(v.unique_titles||0)>=2);
+  // Active tests: still active AND showing 2+ title variants (a live A/B test).
+  if(filter==='active-tests') list = all.filter(v=>v.is_active && (v.unique_titles||0)>=2);
+  // Inactive tests: videos that WERE tested (2+ variants) but have since gone inactive.
+  else if(filter==='inactive-tests') list = all.filter(v=>!v.is_active && (v.unique_titles||0)>=2);
+  // Active: every active video, whether or not a test has been detected.
+  else if(filter==='active') list = all.filter(v=>v.is_active);
+  // 'all' -> everything, no filter.
 
   document.getElementById('hint').textContent = `${list.length} video${list.length!==1?'s':''}`;
 
@@ -277,7 +281,9 @@ function render(){
     document.getElementById('rows').innerHTML = '';
     const st = document.getElementById('state');
     st.style.display='block'; st.className='empty';
-    st.textContent = filter==='tested' ? 'No active title experiments detected yet — they show up as videos accrue samples.' : 'Nothing here yet.';
+    st.textContent = filter==='active-tests' ? 'No live title experiments detected yet — they show up as videos accrue samples.'
+      : filter==='inactive-tests' ? 'No previously-tested videos have gone inactive yet.'
+      : 'Nothing here yet.';
     return;
   }
   document.getElementById('state').style.display='none';
