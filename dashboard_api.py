@@ -24,7 +24,21 @@ from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-from storage import get_all_videos_summary, get_title_daily_counts, get_video_info, init_db
+from config import parse_channels_str
+from scraper import resolve_channel_id
+from storage import (
+    add_channel_admin,
+    get_all_videos_summary,
+    get_channel_display_name,
+    get_channels_with_metrics,
+    get_title_daily_counts,
+    get_video_info,
+    init_db,
+    set_channel_enabled,
+)
+
+# Imported lazily inside handlers (not at module scope) to avoid pulling in
+# main's scheduler-thread machinery before app.py has decided to start it.
 
 app = Flask(__name__)
 
@@ -181,6 +195,14 @@ def dashboard():
     return send_file("dashboard.html")
 
 
+@app.route("/admin", methods=["GET"])
+def admin_page():
+    """Serve the admin shell (channel management). The page itself is a static
+    file with no data in it -- every API call it makes is gated by ADMIN_TOKEN,
+    so serving the shell publicly leaks nothing."""
+    return send_file("admin.html")
+
+
 @app.route("/api/reset", methods=["POST"])
 @require_admin
 def reset_database():
@@ -198,6 +220,106 @@ def reset_database():
         get_pool().putconn(conn)
         logger.warning("Database reset performed by admin from %s", _client_ip())
         return jsonify({"status": "ok", "message": "Database cleared"})
+    except Exception as e:
+        return _server_error(e)
+
+
+@app.route("/api/admin/channels", methods=["GET"])
+@require_admin
+def list_channels():
+    """List all channels with metrics (videos tracked, comments posted,
+    comments/month, avg likes+replies per comment) for the admin UI's
+    include/exclude decision."""
+    try:
+        channels = get_channels_with_metrics()
+        for ch in channels:
+            for key, value in ch.items():
+                ch[key] = serialize_value(value)
+        return jsonify({"channels": channels})
+    except Exception as e:
+        return _server_error(e)
+
+
+@app.route("/api/admin/channels", methods=["POST"])
+@require_admin
+def add_channel():
+    """Add a single channel by @handle or channel ID. Resolves to a canonical
+    channel ID, stores it with track_from_date = today (no backfill), and
+    immediately fast-forwards its known-video anchor so only videos published
+    from now on are ever treated as new."""
+    body = request.get_json(silent=True) or {}
+    handle = str(body.get("handle") or "").strip()
+    display_name = str(body.get("display_name") or "").strip() or handle
+    if not handle:
+        return jsonify({"error": "handle is required"}), 400
+
+    try:
+        channel_id = resolve_channel_id(handle, expected_name=display_name or None)
+        if not channel_id:
+            return jsonify({"error": f"could not resolve '{handle}' to a channel"}), 422
+
+        add_channel_admin(channel_id, display_name)
+        from main import resync_channel_anchor
+        resync_channel_anchor(channel_id, display_name)
+        return jsonify({"status": "ok", "channel_id": channel_id})
+    except Exception as e:
+        return _server_error(e)
+
+
+@app.route("/api/admin/channels/bulk", methods=["POST"])
+@require_admin
+def add_channels_bulk():
+    """Bulk-add channels from a comma-separated '@handle:Display Name' list
+    (same format as the YOUTUBE_CHANNELS env var). Resolving + anchoring ~100+
+    channels can take minutes, so this runs in the background and returns
+    immediately; poll GET /api/admin/channels to watch them appear."""
+    body = request.get_json(silent=True) or {}
+    raw = str(body.get("list") or "")
+    entries = parse_channels_str(raw)
+    if not entries:
+        return jsonify({"error": "no channels found in list"}), 400
+
+    def _import_all():
+        from main import resync_channel_anchor
+        for handle, display_name in entries:
+            try:
+                channel_id = resolve_channel_id(handle, expected_name=display_name or None)
+                if not channel_id:
+                    logger.warning("Bulk import: could not resolve %s", handle)
+                    continue
+                add_channel_admin(channel_id, display_name)
+                resync_channel_anchor(channel_id, display_name)
+            except Exception:
+                logger.exception("Bulk import failed for %s", handle)
+            time.sleep(1)  # be polite to YouTube across ~100+ resolutions
+
+    threading.Thread(target=_import_all, daemon=True).start()
+    return jsonify({"status": "ok", "queued": len(entries)}), 202
+
+
+_CHANNEL_ID_ADMIN_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+
+
+@app.route("/api/admin/channels/<channel_id>", methods=["PATCH"])
+@require_admin
+def update_channel(channel_id: str):
+    """Enable or disable a channel. Enabling (including resuming after a pause)
+    re-syncs the known-video anchor to the current upload head first, so a
+    channel paused for months never backfills videos published while paused."""
+    if not _CHANNEL_ID_ADMIN_RE.match(channel_id):
+        return jsonify({"error": "invalid channel id"}), 400
+    body = request.get_json(silent=True) or {}
+    if "enabled" not in body:
+        return jsonify({"error": "enabled is required"}), 400
+    enabled = bool(body["enabled"])
+
+    try:
+        if enabled:
+            from main import resync_channel_anchor
+            display_name = get_channel_display_name(channel_id) or channel_id
+            resync_channel_anchor(channel_id, display_name)
+        set_channel_enabled(channel_id, enabled)
+        return jsonify({"status": "ok"})
     except Exception as e:
         return _server_error(e)
 

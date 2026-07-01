@@ -44,6 +44,8 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS channels (
                     channel_id TEXT PRIMARY KEY,
                     display_name TEXT NOT NULL,
+                    enabled BOOLEAN DEFAULT TRUE,
+                    track_from_date DATE DEFAULT CURRENT_DATE,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
 
@@ -153,22 +155,138 @@ def init_db():
                     ADD COLUMN IF NOT EXISTS comment_like_count INTEGER DEFAULT 0,
                     ADD COLUMN IF NOT EXISTS comment_reply_count INTEGER DEFAULT 0;
             """)
+
+            # Migration: per-channel enable/disable + per-channel tracking cutoff
+            # (replaces the single global CUTOFF_DATE for anything added/resumed
+            # after initial deploy -- see resync_channel_anchor in main.py).
+            cur.execute("""
+                ALTER TABLE channels
+                    ADD COLUMN IF NOT EXISTS enabled BOOLEAN DEFAULT TRUE,
+                    ADD COLUMN IF NOT EXISTS track_from_date DATE DEFAULT CURRENT_DATE;
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_channels_enabled ON channels(enabled)")
         conn.commit()
     finally:
         return_conn(conn)
 
 
-def add_channel(channel_id: str, display_name: str):
-    """Add or update a channel."""
+def seed_channel_if_missing(channel_id: str, display_name: str):
+    """Register a channel from the env-var seed list, but only if it doesn't
+    already exist -- Postgres is the source of truth once a channel has been
+    created, so this must never clobber an admin's later edits (name, enabled,
+    track_from_date) on every restart."""
     conn = get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO channels (channel_id, display_name) VALUES (%s, %s) "
-                "ON CONFLICT (channel_id) DO UPDATE SET display_name = EXCLUDED.display_name",
+                "ON CONFLICT (channel_id) DO NOTHING",
                 (channel_id, display_name),
             )
         conn.commit()
+    finally:
+        return_conn(conn)
+
+
+def add_channel_admin(channel_id: str, display_name: str) -> bool:
+    """Add a new channel via the admin UI. Returns True if newly created.
+
+    track_from_date defaults to today (CURRENT_DATE), so a channel added today
+    only ever tracks videos published from today onward -- no backfill.
+    """
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO channels (channel_id, display_name, enabled, track_from_date) "
+                "VALUES (%s, %s, TRUE, CURRENT_DATE) "
+                "ON CONFLICT (channel_id) DO UPDATE SET display_name = EXCLUDED.display_name",
+                (channel_id, display_name),
+            )
+            created = cur.rowcount > 0
+        conn.commit()
+        return created
+    finally:
+        return_conn(conn)
+
+
+def set_channel_enabled(channel_id: str, enabled: bool):
+    """Toggle a channel's enabled flag and bump track_from_date to today.
+
+    Bumping track_from_date on every enable (including re-enable after a pause)
+    means resuming a paused channel never backfills videos published while it
+    was paused -- the caller (main.resync_channel_anchor) is responsible for
+    also fast-forwarding the known-video anchor before this flips enabled=TRUE.
+    """
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE channels SET enabled = %s, "
+                "track_from_date = CASE WHEN %s THEN CURRENT_DATE ELSE track_from_date END "
+                "WHERE channel_id = %s",
+                (enabled, enabled, channel_id),
+            )
+        conn.commit()
+    finally:
+        return_conn(conn)
+
+
+def get_channel_display_name(channel_id: str) -> Optional[str]:
+    """Look up a single channel's display name (e.g. for anchor-resync logging)."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT display_name FROM channels WHERE channel_id = %s", (channel_id,))
+            row = cur.fetchone()
+            return row[0] if row else None
+    finally:
+        return_conn(conn)
+
+
+def get_enabled_channels() -> List[dict]:
+    """Channels the scheduler should actively poll: [{channel_id, display_name,
+    track_from_date}, ...]. Read fresh every cycle so admin UI toggles take
+    effect without a redeploy."""
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT channel_id, display_name, track_from_date "
+                "FROM channels WHERE enabled = TRUE"
+            )
+            return [dict(row) for row in cur.fetchall()]
+    finally:
+        return_conn(conn)
+
+
+def get_channels_with_metrics() -> List[dict]:
+    """All channels with enough data for an informed include/exclude decision:
+    videos tracked, comments posted, comments/month, and avg likes+replies per
+    comment. Used by the admin UI."""
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT c.channel_id, c.display_name, c.enabled, c.created_at,
+                       c.track_from_date,
+                       COUNT(v.video_id) AS videos_tracked,
+                       COUNT(v.comment_id) AS comments_posted,
+                       COALESCE(AVG(v.comment_like_count) FILTER (WHERE v.comment_id IS NOT NULL), 0) AS avg_likes_per_comment,
+                       COALESCE(AVG(v.comment_reply_count) FILTER (WHERE v.comment_id IS NOT NULL), 0) AS avg_replies_per_comment,
+                       COALESCE(
+                           COUNT(v.comment_id) FILTER (WHERE v.comment_posted_at IS NOT NULL)
+                           / GREATEST(1.0, EXTRACT(EPOCH FROM (NOW() - MIN(v.comment_posted_at))) / (86400.0 * 30)),
+                           0
+                       ) AS comments_per_month
+                FROM channels c
+                LEFT JOIN videos v ON v.channel_id = c.channel_id
+                GROUP BY c.channel_id
+                ORDER BY c.created_at DESC
+                """
+            )
+            return [dict(row) for row in cur.fetchall()]
     finally:
         return_conn(conn)
 

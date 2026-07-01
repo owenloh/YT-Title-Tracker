@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Channel Admin — Title Test Tracker</title>
+<style>
+  :root{
+    --bg:#f5f6f8; --surface:#ffffff; --surface-2:#fbfbfc;
+    --border:#e9eaee; --border-strong:#dfe1e6;
+    --ink:#1b1d24; --muted:#6b7077; --faint:#9aa0a8;
+    --accent:#6366f1; --accent-soft:#eef0fe;
+    --green:#16a34a; --green-bg:#e7f6ec;
+    --red:#dc2626; --red-bg:#fceaea;
+    --shadow:0 1px 2px rgba(16,18,28,.04), 0 2px 6px rgba(16,18,28,.05);
+    --radius:14px;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{
+    font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;
+    background:var(--bg); color:var(--ink); line-height:1.45; padding:28px 22px 60px;
+  }
+  .wrap{max-width:1180px;margin:0 auto}
+  header{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:22px;flex-wrap:wrap}
+  h1{font-size:20px;font-weight:700;letter-spacing:-.02em}
+  h1 a{color:var(--muted);font-size:13px;font-weight:500;margin-left:12px;text-decoration:none}
+  h1 a:hover{color:var(--accent)}
+
+  .panel{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);padding:20px;margin-bottom:18px}
+  .panel h2{font-size:14px;margin-bottom:12px}
+  label{font-size:12.5px;color:var(--muted);display:block;margin-bottom:5px}
+  input[type=text], input[type=password], textarea{
+    width:100%;padding:9px 11px;border:1px solid var(--border-strong);border-radius:9px;
+    font-size:13.5px;font-family:inherit;background:var(--surface-2);color:var(--ink);
+  }
+  textarea{min-height:90px;resize:vertical;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px}
+  button{
+    border:0;background:var(--accent);color:#fff;font-weight:600;font-size:13px;
+    padding:9px 16px;border-radius:9px;cursor:pointer;font-family:inherit;
+  }
+  button:hover{opacity:.92}
+  button.secondary{background:var(--surface-2);color:var(--ink);border:1px solid var(--border-strong)}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}
+  .row > div{flex:1;min-width:180px}
+  .msg{font-size:12.5px;margin-top:10px}
+  .msg.ok{color:var(--green)} .msg.err{color:var(--red)}
+
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  thead th{font-size:11px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--faint);
+        text-align:left;padding:10px 12px;background:var(--surface-2);border-bottom:1px solid var(--border)}
+  tbody td{padding:10px 12px;border-bottom:1px solid var(--border);vertical-align:middle}
+  tbody tr:last-child td{border-bottom:0}
+  .name{font-weight:600}
+  .num{font-variant-numeric:tabular-nums}
+  .muted{color:var(--muted)}
+  .switch{position:relative;display:inline-block;width:38px;height:22px}
+  .switch input{opacity:0;width:0;height:0}
+  .slider{position:absolute;cursor:pointer;inset:0;background:var(--border-strong);border-radius:999px;transition:.15s}
+  .slider::before{content:"";position:absolute;height:16px;width:16px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.15s}
+  input:checked + .slider{background:var(--green)}
+  input:checked + .slider::before{transform:translateX(16px)}
+  .gate{max-width:360px;margin:80px auto;text-align:center}
+  .gate h1{margin-bottom:16px}
+  .hidden{display:none}
+  .hint{font-size:12px;color:var(--faint);margin-top:6px}
+</style>
+</head>
+<body>
+
+<div id="gate" class="gate panel">
+  <h1>Channel Admin</h1>
+  <label for="token">Admin password</label>
+  <input type="password" id="token" placeholder="Paste the admin token">
+  <div style="margin-top:10px"><button onclick="unlock()">Unlock</button></div>
+  <div id="gateMsg" class="msg err"></div>
+</div>
+
+<div id="app" class="wrap hidden">
+  <header>
+    <h1>Channel Admin <a href="/">← Dashboard</a></h1>
+    <button class="secondary" onclick="logout()">Lock</button>
+  </header>
+
+  <div class="panel">
+    <h2>Add a channel</h2>
+    <div class="row">
+      <div>
+        <label for="handle">@handle or channel ID</label>
+        <input type="text" id="handle" placeholder="@veritasium">
+      </div>
+      <div>
+        <label for="displayName">Display name (optional)</label>
+        <input type="text" id="displayName" placeholder="Veritasium">
+      </div>
+      <div style="flex:0 0 auto"><button onclick="addChannel()">Add channel</button></div>
+    </div>
+    <div class="hint">Tracks from today onward only — nothing published before it was added gets backfilled.</div>
+    <div id="addMsg" class="msg"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Bulk import</h2>
+    <label for="bulk">Comma-separated <code>@handle:Display Name</code> list (same format as YOUTUBE_CHANNELS)</label>
+    <textarea id="bulk" placeholder="@MrBeast:MrBeast,@MarkRober:Mark Rober,..."></textarea>
+    <div style="margin-top:10px"><button onclick="bulkImport()">Import list</button></div>
+    <div class="hint">Runs in the background (resolving handles one at a time) — refresh the table below to watch channels appear.</div>
+    <div id="bulkMsg" class="msg"></div>
+  </div>
+
+  <div class="panel">
+    <div class="row" style="margin-bottom:6px">
+      <h2 style="margin:0">Channels</h2>
+      <div style="flex:0 0 auto"><button class="secondary" onclick="loadChannels()">Refresh</button></div>
+    </div>
+    <div class="scroll" style="overflow-x:auto">
+      <table>
+        <thead>
+          <tr>
+            <th>Tracked</th>
+            <th>Channel</th>
+            <th>Added</th>
+            <th>Videos</th>
+            <th>Comments</th>
+            <th>Comments / mo</th>
+            <th>Avg likes / comment</th>
+            <th>Avg replies / comment</th>
+          </tr>
+        </thead>
+        <tbody id="rows"><tr><td colspan="8" class="muted">Loading…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+let TOKEN = sessionStorage.getItem('admin_token') || '';
+
+function authHeaders(){ return {'X-Admin-Token': TOKEN, 'Content-Type': 'application/json'}; }
+
+async function api(path, opts={}){
+  const res = await fetch(path, {...opts, headers: {...authHeaders(), ...(opts.headers||{})}});
+  if(res.status === 401){ logout(); throw new Error('unauthorized'); }
+  const data = await res.json().catch(()=>({}));
+  if(!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+  return data;
+}
+
+function unlock(){
+  TOKEN = document.getElementById('token').value.trim();
+  if(!TOKEN){ return; }
+  sessionStorage.setItem('admin_token', TOKEN);
+  document.getElementById('gateMsg').textContent = '';
+  tryEnter();
+}
+
+function logout(){
+  sessionStorage.removeItem('admin_token');
+  TOKEN = '';
+  document.getElementById('app').classList.add('hidden');
+  document.getElementById('gate').classList.remove('hidden');
+}
+
+async function tryEnter(){
+  try{
+    await api('/api/admin/channels');
+    document.getElementById('gate').classList.add('hidden');
+    document.getElementById('app').classList.remove('hidden');
+    loadChannels();
+  }catch(e){
+    document.getElementById('gateMsg').textContent = 'Wrong password, or admin endpoints are disabled (ADMIN_TOKEN not set on the server).';
+  }
+}
+
+function esc(s){ return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function fmtDate(d){ return d ? new Date(d).toLocaleDateString(undefined,{year:'numeric',month:'short',day:'numeric'}) : '—'; }
+function fmtNum(n){ return (Math.round((n||0)*10)/10).toString(); }
+
+async function loadChannels(){
+  const tbody = document.getElementById('rows');
+  try{
+    const data = await api('/api/admin/channels');
+    const channels = data.channels || [];
+    if(!channels.length){ tbody.innerHTML = '<tr><td colspan="8" class="muted">No channels yet — add one above.</td></tr>'; return; }
+    tbody.innerHTML = channels.map(c => `
+      <tr>
+        <td>
+          <label class="switch">
+            <input type="checkbox" ${c.enabled ? 'checked' : ''} onchange="toggleChannel('${c.channel_id}', this.checked, this)">
+            <span class="slider"></span>
+          </label>
+        </td>
+        <td class="name">${esc(c.display_name)}</td>
+        <td class="muted">${fmtDate(c.created_at)}</td>
+        <td class="num">${c.videos_tracked || 0}</td>
+        <td class="num">${c.comments_posted || 0}</td>
+        <td class="num">${fmtNum(c.comments_per_month)}</td>
+        <td class="num">${fmtNum(c.avg_likes_per_comment)}</td>
+        <td class="num">${fmtNum(c.avg_replies_per_comment)}</td>
+      </tr>`).join('');
+  }catch(e){
+    tbody.innerHTML = `<tr><td colspan="8" class="msg err">${esc(e.message)}</td></tr>`;
+  }
+}
+
+async function toggleChannel(channelId, enabled, checkbox){
+  checkbox.disabled = true;
+  try{
+    await api('/api/admin/channels/' + encodeURIComponent(channelId), {
+      method: 'PATCH', body: JSON.stringify({enabled})
+    });
+  }catch(e){
+    checkbox.checked = !enabled; // revert on failure
+    alert('Failed to update: ' + e.message);
+  }finally{
+    checkbox.disabled = false;
+    loadChannels();
+  }
+}
+
+async function addChannel(){
+  const handle = document.getElementById('handle').value.trim();
+  const displayName = document.getElementById('displayName').value.trim();
+  const msg = document.getElementById('addMsg');
+  if(!handle){ msg.className='msg err'; msg.textContent='Enter a handle or channel ID.'; return; }
+  msg.className='msg'; msg.textContent='Adding…';
+  try{
+    await api('/api/admin/channels', {method:'POST', body: JSON.stringify({handle, display_name: displayName})});
+    msg.className='msg ok'; msg.textContent='Added.';
+    document.getElementById('handle').value=''; document.getElementById('displayName').value='';
+    loadChannels();
+  }catch(e){
+    msg.className='msg err'; msg.textContent = e.message;
+  }
+}
+
+async function bulkImport(){
+  const list = document.getElementById('bulk').value.trim();
+  const msg = document.getElementById('bulkMsg');
+  if(!list){ msg.className='msg err'; msg.textContent='Paste a list first.'; return; }
+  msg.className='msg'; msg.textContent='Queuing…';
+  try{
+    const data = await api('/api/admin/channels/bulk', {method:'POST', body: JSON.stringify({list})});
+    msg.className='msg ok'; msg.textContent = `Queued ${data.queued} channel(s) — importing in the background, refresh the table below periodically.`;
+    document.getElementById('bulk').value='';
+  }catch(e){
+    msg.className='msg err'; msg.textContent = e.message;
+  }
+}
+
+if(TOKEN) tryEnter();
+</script>
+</body>
+</html>

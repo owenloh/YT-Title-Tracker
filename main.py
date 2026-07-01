@@ -20,16 +20,17 @@ from config import (
     NEW_VIDEO_CHECK_INTERVAL,
     RATIO_WINDOW_DAYS,
     SAMPLES_PER_RUN,
+    SCHEDULER_WORKERS,
     SKIP_COMMENT,
 )
 from scraper import get_videos_from_rss, is_short, sample_titles
 from storage import (
-    add_channel,
     add_title_sample,
     add_video,
     get_active_videos,
     get_comment_id,
     get_comment_state,
+    get_enabled_channels,
     get_known_video_ids_for_channel,
     get_recent_title_stats,
     get_title_stats,
@@ -39,6 +40,7 @@ from storage import (
     is_video_active,
     mark_video_ignored,
     mark_video_inactive,
+    seed_channel_if_missing,
     set_comment_id,
     update_comment_edited,
     update_comment_meta,
@@ -47,8 +49,42 @@ from storage import (
 )
 from youtube_comment import fetch_comment_meta, post_comment, update_comment
 
-# Thread pool for background processing
-executor = ThreadPoolExecutor(max_workers=10)
+# Thread pool for background processing (channel checks, video sampling).
+# I/O-bound work, so this can comfortably exceed CPU core count -- sized via
+# SCHEDULER_WORKERS to give headroom as more channels are tracked.
+executor = ThreadPoolExecutor(max_workers=SCHEDULER_WORKERS)
+
+
+def resync_channel_anchor(channel_id: str, channel_name: str, max_videos: int = 50) -> int:
+    """Fast-forward a channel's "known videos" anchor to its current upload head
+    without processing anything.
+
+    Used whenever a channel starts being actively tracked (fresh add, or resume
+    after being paused/disabled): it stores every currently-existing video as a
+    known, inactive reference point, so the next check_new_videos() pass only
+    ever finds videos published AFTER this moment as "new". Without this, a
+    channel paused for months would resume by treating its whole upload backlog
+    from the pause window as new videos to process.
+
+    Returns the number of videos recorded.
+    """
+    rss_videos = get_videos_from_rss(channel_id, expected_name=channel_name, max_videos=max_videos)
+    if not rss_videos:
+        return 0
+
+    long_form_videos = [
+        (video_id, published_at) for video_id, published_at in rss_videos
+        if not is_short(video_id)
+    ]
+    if not long_form_videos:
+        return 0
+
+    count = 0
+    for video_id, published_at in long_form_videos:
+        ts = published_at if published_at is not None else datetime.now()
+        if add_video(video_id, channel_id, ts, is_active=False):
+            count += 1
+    return count
 
 
 def reprocess_videos_without_comments():
@@ -272,23 +308,27 @@ def process_video(video_id: str, channel_id: str, channel_name: str, published_a
 
 def check_new_videos():
     """
-    Check all channels for new videos IN PARALLEL.
-    When new video found, spawn background task to process it immediately.
+    Check all enabled channels (read fresh from Postgres, not the static env
+    list -- so admin UI enable/disable/add takes effect without a redeploy) for
+    new videos IN PARALLEL. When new video found, spawn background task to
+    process it immediately.
     """
     print(f"\n=== Checking for new videos at {datetime.now()} ===")
-    
-    def check_channel(channel_slug: str, channel_name: str) -> List[tuple]:
+
+    def check_channel(channel_slug: str, channel_name: str, track_from_date) -> List[tuple]:
         """Check single channel, return list of new videos to process."""
         new_videos = []
+        # Per-channel cutoff (set on add / resume) takes precedence; legacy
+        # channels seeded before this existed fall back to the global cutoff.
+        effective_cutoff = track_from_date or CUTOFF_DATE
         try:
             rss_videos = get_videos_from_rss(channel_slug, expected_name=channel_name, max_videos=50)
             if not rss_videos:
                 return []
-            
+
             # Check if we have dates (RSS) or not (HTTP fallback)
             has_dates = rss_videos[0][1] is not None
-            
-            add_channel(channel_slug, channel_name)
+
             known_ids = set(get_known_video_ids_for_channel(channel_slug, limit=50))
             
             if has_dates:
@@ -318,8 +358,8 @@ def check_new_videos():
                 
                 processed_count = 0
                 for video_id, published_at in candidates:
-                    # Skip if before cutoff - don't store at all
-                    if published_at.date() < CUTOFF_DATE:
+                    # Skip if before this channel's effective cutoff - don't store at all
+                    if published_at.date() < effective_cutoff:
                         continue
                     
                     # Skip if already known
@@ -371,10 +411,12 @@ def check_new_videos():
         
         return new_videos
     
-    # Check all channels in parallel
+    # Check all enabled channels (from Postgres) in parallel
+    channels = get_enabled_channels()
     futures = {
-        executor.submit(check_channel, ch_slug, ch_name): (ch_slug, ch_name)
-        for ch_slug, ch_name in CHANNELS
+        executor.submit(check_channel, ch["channel_id"], ch["display_name"], ch["track_from_date"]):
+            (ch["channel_id"], ch["display_name"])
+        for ch in channels
     }
     
     # Collect new videos and spawn processing tasks
@@ -393,74 +435,94 @@ def check_new_videos():
             traceback.print_exc()
 
 
+def _check_one_active_video(video_info: dict) -> None:
+    """Body of the hourly per-video check, run concurrently across all active
+    videos (see check_active_videos) rather than one at a time -- with a few
+    hundred active videos across many channels, a sequential loop here could
+    run longer than ACTIVE_VIDEO_CHECK_INTERVAL and delay new-video checks,
+    since both run on the same scheduler thread."""
+    video_id = video_info["video_id"]
+    channel_name = video_info.get("channel_name") or video_info["channel_id"]
+
+    try:
+        # Stagnated (same single title for N days straight) -> stop tracking.
+        # The comment already reflects the latest titles from prior checks, so
+        # there's nothing new to post here.
+        if not is_video_active(video_id, INACTIVE_DAYS_THRESHOLD):
+            print(f"[{channel_name}] {video_id} stagnated ({INACTIVE_DAYS_THRESHOLD}+ days) - marking inactive")
+            mark_video_inactive(video_id)
+            return
+
+        update_last_checked(video_id)
+
+        # Always re-sample so new variants are caught on every hourly pass.
+        # _ensure_comment posts the first comment if this pass is what finally
+        # pushes the video to >= 2 distinct titles, otherwise it updates.
+        before = _distinct_titles(video_id)
+        titles = sample_titles(video_id, SAMPLES_PER_RUN, parallel=True)
+        if not titles:
+            return
+        _record_samples(video_id, titles)
+        _ensure_comment(video_id, channel_name, before)
+
+        # Refresh the comment's moderation status + engagement (likes/replies)
+        # so the dashboard shows current virality and held->published flips.
+        cid = get_comment_id(video_id)
+        if cid:
+            meta = fetch_comment_meta(cid)
+            if meta:
+                update_comment_meta(video_id, meta["status"], meta["likes"], meta["replies"])
+
+    except Exception as e:
+        print(f"Error checking video {video_id}: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+
+
 def check_active_videos():
     """Check active videos for title changes (hourly task).
-    
+
     Videos are already filtered by is_active = TRUE in the database.
     If a video has stagnated (same single title for N days), mark it inactive permanently.
+
+    Runs across the shared executor (same pattern as check_new_videos) so the
+    sweep finishes in roughly one video's worth of wall-clock time instead of
+    len(active_videos) times that -- necessary once many channels/videos are
+    tracked, since this and check_new_videos share the scheduler's main thread.
     """
     print(f"\n=== Checking active videos at {datetime.now()} ===")
 
     active_videos = get_active_videos()
     print(f"Found {len(active_videos)} active videos to check")
 
-    for video_info in active_videos:
-        video_id = video_info["video_id"]
-        channel_name = video_info.get("channel_name") or video_info["channel_id"]
-
-        try:
-            # Stagnated (same single title for N days straight) -> stop tracking.
-            # The comment already reflects the latest titles from prior checks, so
-            # there's nothing new to post here.
-            if not is_video_active(video_id, INACTIVE_DAYS_THRESHOLD):
-                print(f"[{channel_name}] {video_id} stagnated ({INACTIVE_DAYS_THRESHOLD}+ days) - marking inactive")
-                mark_video_inactive(video_id)
-                continue
-
-            update_last_checked(video_id)
-
-            # Always re-sample so new variants are caught on every hourly pass.
-            # parallel=True fires this video's samples concurrently (like the
-            # new-video fast path), so the hourly sweep of many active videos
-            # finishes in minutes instead of ~SAMPLES_PER_RUN*1.1s per video --
-            # important once a lot of channels are tracked.
-            # _ensure_comment posts the first comment if this pass is what finally
-            # pushes the video to >= 2 distinct titles, otherwise it updates.
-            before = _distinct_titles(video_id)
-            titles = sample_titles(video_id, SAMPLES_PER_RUN, parallel=True)
-            if not titles:
-                continue
-            _record_samples(video_id, titles)
-            _ensure_comment(video_id, channel_name, before)
-
-            # Refresh the comment's moderation status + engagement (likes/replies)
-            # so the dashboard shows current virality and held->published flips.
-            cid = get_comment_id(video_id)
-            if cid:
-                meta = fetch_comment_meta(cid)
-                if meta:
-                    update_comment_meta(video_id, meta["status"], meta["likes"], meta["replies"])
-
-        except Exception as e:
-            print(f"Error checking video {video_id}: {e}", file=sys.stderr)
-            import traceback
-            traceback.print_exc()
+    futures = [executor.submit(_check_one_active_video, v) for v in active_videos]
+    for future in as_completed(futures):
+        future.result()  # exceptions are already caught/logged inside; re-raise only bugs in the wrapper itself
 
 
 def run_scheduler():
     """Run the main scheduler loop."""
     print("Initializing database...")
     init_db()
-    
+
+    # Seed channels from the env-var list on first boot only -- this never
+    # overwrites a channel that already exists (see seed_channel_if_missing),
+    # so it's safe to leave YOUTUBE_CHANNELS set permanently. From here on,
+    # Postgres (managed via the admin UI) is the source of truth.
+    for ch_id, ch_name in CHANNELS:
+        seed_channel_if_missing(ch_id, ch_name)
+
     # Reprocess any videos that have no comments (from failed earlier runs)
     reprocess_videos_without_comments()
-    
+
+    enabled_count = len(get_enabled_channels())
     print(f"Starting scheduler:")
     print(f"  - New video check: every {NEW_VIDEO_CHECK_INTERVAL}s")
     print(f"  - Active video check: every {ACTIVE_VIDEO_CHECK_INTERVAL}s")
-    print(f"  - Channels: {len(CHANNELS)}")
-    print(f"  - Cutoff date: {CUTOFF_DATE}")
+    print(f"  - Channels enabled: {enabled_count}")
+    print(f"  - Fallback cutoff date (legacy channels only): {CUTOFF_DATE}")
     print(f"  - Inactive threshold: {INACTIVE_DAYS_THRESHOLD} days")
+    print(f"  - Scheduler workers: {SCHEDULER_WORKERS}")
     
     last_new_check = 0
     last_active_check = time.time()  # Don't run hourly check immediately on startup

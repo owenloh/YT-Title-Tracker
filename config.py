@@ -10,17 +10,32 @@ load_dotenv()
 # PostgreSQL connection (Railway provides DATABASE_URL)
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
-# Multi-channel support: comma-separated channel IDs or names
-# Format: "channel_id:display_name,channel_id:display_name" or just channel IDs
+# Multi-channel support: comma-separated channel IDs or @handles.
+# Format: "channel_id_or_handle:display_name,..." or just IDs/handles.
+# This is only the SEED list used to populate the `channels` table on first boot
+# (see storage.seed_channel_if_missing) -- after that, Postgres is the source of
+# truth and channels are managed via the admin UI (enable/disable/add), not by
+# editing this env var and redeploying.
+def parse_channels_str(raw: str) -> List[tuple]:
+    channels = []
+    for ch in raw.split(","):
+        ch = ch.strip()
+        if not ch:
+            continue
+        if ":" in ch:
+            ch_id, ch_name = ch.split(":", 1)
+            channels.append((ch_id.strip(), ch_name.strip()))
+        else:
+            channels.append((ch.strip(), ch.strip()))
+    return channels
+
+
 CHANNELS_STR = os.environ.get("YOUTUBE_CHANNELS", "UCHnyfMqiRRG1u-2MsSQLbXA:Veritasium")
-CHANNELS: List[tuple[str, str]] = []
-for ch in CHANNELS_STR.split(","):
-    ch = ch.strip()
-    if ":" in ch:
-        ch_id, ch_name = ch.split(":", 1)
-        CHANNELS.append((ch_id.strip(), ch_name.strip()))
-    else:
-        CHANNELS.append((ch.strip(), ch.strip()))
+CHANNELS: List[tuple[str, str]] = parse_channels_str(CHANNELS_STR)
+
+# Thread pool size for the scheduler (channel checks + active-video sampling).
+# I/O-bound work, so this can comfortably exceed CPU core count.
+SCHEDULER_WORKERS = int(os.environ.get("SCHEDULER_WORKERS", "24"))
 
 # OAuth for posting/editing comments
 YOUTUBE_CLIENT_ID = os.environ.get("YOUTUBE_CLIENT_ID", "")
