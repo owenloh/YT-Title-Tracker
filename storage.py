@@ -5,21 +5,30 @@ from typing import List, Optional, Tuple
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from psycopg2.pool import SimpleConnectionPool
+from psycopg2.pool import ThreadedConnectionPool
 
-from config import DATABASE_URL, RATIO_WINDOW_DAYS
+from config import DATABASE_URL, DB_POOL_MAX, RATIO_WINDOW_DAYS, SCHEDULER_WORKERS
 
-# Connection pool (min 1, max 20 connections)
-_pool: Optional[SimpleConnectionPool] = None
+# Connection pool. MUST be the *threaded* pool: the scheduler runs many worker
+# threads and Flask serves requests on its own threads, all sharing this pool.
+# SimpleConnectionPool is documented as NOT thread-safe (its internal state can
+# corrupt under concurrent getconn/putconn), so it was the wrong choice here.
+_pool: Optional[ThreadedConnectionPool] = None
 
 
 def get_pool():
-    """Get or create connection pool."""
+    """Get or create the (thread-safe) connection pool.
+
+    Sized so maxconn comfortably exceeds the scheduler's worker count plus a
+    margin for concurrent Flask requests -- otherwise getconn() raises
+    "connection pool exhausted" once demand crosses the ceiling.
+    """
     global _pool
     if _pool is None:
         if not DATABASE_URL:
             raise ValueError("DATABASE_URL not set")
-        _pool = SimpleConnectionPool(1, 20, DATABASE_URL)
+        maxconn = max(DB_POOL_MAX, SCHEDULER_WORKERS + 8)
+        _pool = ThreadedConnectionPool(2, maxconn, DATABASE_URL)
     return _pool
 
 
@@ -156,9 +165,12 @@ def init_db():
                     ADD COLUMN IF NOT EXISTS comment_reply_count INTEGER DEFAULT 0;
             """)
 
-            # Migration: per-channel enable/disable + per-channel tracking cutoff
-            # (replaces the single global CUTOFF_DATE for anything added/resumed
-            # after initial deploy -- see resync_channel_anchor in main.py).
+            # Migration: per-channel enable/disable + per-channel tracking cutoff.
+            # track_from_date replaces the single global CUTOFF_DATE: it's set to
+            # today whenever a channel is added or (re)enabled, so new/resumed
+            # channels only ever track uploads from that day forward. Existing
+            # rows are backfilled to the deploy date by the DEFAULT, which is
+            # harmless -- their historical videos are already stored and active.
             cur.execute("""
                 ALTER TABLE channels
                     ADD COLUMN IF NOT EXISTS enabled BOOLEAN DEFAULT TRUE,
@@ -218,9 +230,10 @@ def set_channel_enabled(channel_id: str, enabled: bool):
     """Toggle a channel's enabled flag and bump track_from_date to today.
 
     Bumping track_from_date on every enable (including re-enable after a pause)
-    means resuming a paused channel never backfills videos published while it
-    was paused -- the caller (main.resync_channel_anchor) is responsible for
-    also fast-forwarding the known-video anchor before this flips enabled=TRUE.
+    is the entire no-backfill mechanism: on resume, check_channel drops every
+    candidate published before today (the whole pause-window backlog) via the
+    date gate, so only uploads from the resume day forward are tracked. No
+    separate anchor resync is needed.
     """
     conn = get_conn()
     try:
@@ -232,18 +245,6 @@ def set_channel_enabled(channel_id: str, enabled: bool):
                 (enabled, enabled, channel_id),
             )
         conn.commit()
-    finally:
-        return_conn(conn)
-
-
-def get_channel_display_name(channel_id: str) -> Optional[str]:
-    """Look up a single channel's display name (e.g. for anchor-resync logging)."""
-    conn = get_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT display_name FROM channels WHERE channel_id = %s", (channel_id,))
-            row = cur.fetchone()
-            return row[0] if row else None
     finally:
         return_conn(conn)
 
@@ -590,6 +591,10 @@ def get_active_videos() -> List[dict]:
     Returns every active (non-stagnated, non-ignored) video -- including ones
     without a comment yet -- so they keep accruing samples and can surface a 2nd
     variant (and earn their first comment) over time, not just at startup.
+
+    Videos on a DISABLED channel are excluded: unticking a channel in the admin
+    UI makes it fully dormant (no re-sampling, no comment edits), not just "stops
+    picking up new videos". Its history stays in the DB and resumes when re-enabled.
     """
     conn = get_conn()
     try:
@@ -599,6 +604,7 @@ def get_active_videos() -> List[dict]:
                 "       v.published_at, v.comment_id, v.comment_status "
                 "FROM videos v JOIN channels c ON v.channel_id = c.channel_id "
                 "WHERE v.is_active = TRUE AND v.is_ignored = FALSE AND v.is_deleted = FALSE "
+                "  AND c.enabled = TRUE "
                 "ORDER BY v.published_at DESC"
             )
             return [dict(row) for row in cur.fetchall()]
@@ -802,7 +808,11 @@ def get_active_videos_for_dashboard() -> List[dict]:
 
 
 def get_videos_without_comments() -> List[dict]:
-    """Get active videos that have no comment_id (need reprocessing)."""
+    """Get active videos that have no comment_id (need reprocessing).
+
+    Excludes disabled channels for the same reason as get_active_videos -- a
+    paused channel does no work, including startup reprocessing.
+    """
     conn = get_conn()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -811,10 +821,11 @@ def get_videos_without_comments() -> List[dict]:
                 SELECT v.video_id, v.channel_id, c.display_name as channel_name, v.published_at
                 FROM videos v
                 JOIN channels c ON v.channel_id = c.channel_id
-                WHERE v.is_active = TRUE 
-                  AND v.is_ignored = FALSE 
-                  AND v.is_deleted = FALSE 
+                WHERE v.is_active = TRUE
+                  AND v.is_ignored = FALSE
+                  AND v.is_deleted = FALSE
                   AND v.comment_id IS NULL
+                  AND c.enabled = TRUE
                 ORDER BY v.published_at DESC
                 """
             )

@@ -54,37 +54,14 @@ from youtube_comment import fetch_comment_meta, post_comment, update_comment
 # SCHEDULER_WORKERS to give headroom as more channels are tracked.
 executor = ThreadPoolExecutor(max_workers=SCHEDULER_WORKERS)
 
-
-def resync_channel_anchor(channel_id: str, channel_name: str, max_videos: int = 50) -> int:
-    """Fast-forward a channel's "known videos" anchor to its current upload head
-    without processing anything.
-
-    Used whenever a channel starts being actively tracked (fresh add, or resume
-    after being paused/disabled): it stores every currently-existing video as a
-    known, inactive reference point, so the next check_new_videos() pass only
-    ever finds videos published AFTER this moment as "new". Without this, a
-    channel paused for months would resume by treating its whole upload backlog
-    from the pause window as new videos to process.
-
-    Returns the number of videos recorded.
-    """
-    rss_videos = get_videos_from_rss(channel_id, expected_name=channel_name, max_videos=max_videos)
-    if not rss_videos:
-        return 0
-
-    long_form_videos = [
-        (video_id, published_at) for video_id, published_at in rss_videos
-        if not is_short(video_id)
-    ]
-    if not long_form_videos:
-        return 0
-
-    count = 0
-    for video_id, published_at in long_form_videos:
-        ts = published_at if published_at is not None else datetime.now()
-        if add_video(video_id, channel_id, ts, is_active=False):
-            count += 1
-    return count
+# NOTE on pause/resume with no backfill: there is deliberately no "anchor
+# resync" step. A channel's per-channel track_from_date cutoff is bumped to
+# today whenever it's added or (re)enabled (see storage.set_channel_enabled /
+# add_channel_admin), and check_channel skips any candidate published before
+# that cutoff. So a channel paused for months and then re-enabled simply has
+# its entire pause-window backlog skipped by the date gate -- nothing to
+# process, no back-catalogue crawl -- and only genuinely new uploads (published
+# on/after the resume day) are ever picked up.
 
 
 def reprocess_videos_without_comments():
@@ -332,51 +309,50 @@ def check_new_videos():
             known_ids = set(get_known_video_ids_for_channel(channel_slug, limit=50))
             
             if has_dates:
-                # RSS MODE: We have publish dates
-                # RSS includes shorts, so filter them out first before anchor detection
-                # NEVER store shorts - they can't be anchors for HTTP fallback
-                
-                # Filter to long-form videos only
-                long_form_videos = []
-                for video_id, published_at in rss_videos:
-                    if not is_short(video_id):
-                        long_form_videos.append((video_id, published_at))
-                
-                if not long_form_videos:
-                    print(f"[{channel_name}] No long-form videos found")
-                    return new_videos
-                
-                # Find anchor (first known video) in long-form list
+                # RSS MODE: We have publish dates.
+                #
+                # Anchor = the newest video we already know. We deliberately find
+                # it in the RAW feed WITHOUT classifying shorts first: shorts are
+                # never stored, so a short can never match known_ids and can never
+                # be mistaken for the anchor. This lets us run the (expensive,
+                # 1-2 HTTP calls each) is_short() check only on the handful of
+                # genuinely-new candidates instead of on all ~50 feed items every
+                # cycle -- the difference between a few and thousands of extra
+                # requests per minute once many channels are tracked.
                 anchor_index = None
-                for i, (video_id, _) in enumerate(long_form_videos):
+                for i, (video_id, _) in enumerate(rss_videos):
                     if video_id in known_ids:
                         anchor_index = i
                         break
-                
-                # Only consider videos before anchor (newer)
-                candidates = long_form_videos[:anchor_index] if anchor_index is not None else long_form_videos
-                
+
+                # Only consider videos newer than the anchor (before it in the list).
+                candidates = rss_videos[:anchor_index] if anchor_index is not None else rss_videos
+
                 processed_count = 0
                 for video_id, published_at in candidates:
-                    # Skip if before this channel's effective cutoff - don't store at all
-                    if published_at.date() < effective_cutoff:
-                        continue
-                    
-                    # Skip if already known
                     if video_id in known_ids:
                         continue
-                    
-                    # Store and process long-form video
+                    # Cheap date gate BEFORE the costly shorts check: anything
+                    # before this channel's cutoff (incl. a resumed channel's
+                    # whole pause-window backlog) is dropped without a network call.
+                    if published_at.date() < effective_cutoff:
+                        continue
+                    # Now pay for the shorts classification, only for new in-window videos.
+                    if is_short(video_id):
+                        continue
                     if add_video(video_id, channel_slug, published_at):
                         new_videos.append((video_id, channel_slug, channel_name, published_at))
                         processed_count += 1
                         print(f"[{channel_name}] NEW VIDEO: {video_id} (published {published_at.date()})")
-                
-                # First run: ensure at least 1 long-form video exists for HTTP fallback anchor
+
+                # First run for this channel: make sure at least one long-form
+                # video is stored as an inactive anchor, so subsequent cycles have
+                # a reference point and never re-crawl the back catalogue.
                 if not known_ids and processed_count == 0:
-                    # No videos after cutoff - store newest long-form as anchor (inactive)
-                    vid_id, vid_date = long_form_videos[0]
-                    add_video(vid_id, channel_slug, vid_date, is_active=False)
+                    for video_id, published_at in rss_videos:
+                        if not is_short(video_id):
+                            add_video(video_id, channel_slug, published_at, is_active=False)
+                            break
             
             else:
                 # HTTP MODE: No dates, already filtered to long-form only

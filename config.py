@@ -37,6 +37,12 @@ CHANNELS: List[tuple[str, str]] = parse_channels_str(CHANNELS_STR)
 # I/O-bound work, so this can comfortably exceed CPU core count.
 SCHEDULER_WORKERS = int(os.environ.get("SCHEDULER_WORKERS", "24"))
 
+# DB connection pool ceiling. Must exceed SCHEDULER_WORKERS (each worker may hold
+# a connection briefly) plus headroom for concurrent Flask API requests, or the
+# pool raises "connection pool exhausted" under load. Keep below the Postgres
+# server's max_connections (Railway Postgres defaults to ~100).
+DB_POOL_MAX = int(os.environ.get("DB_POOL_MAX", "32"))
+
 # OAuth for posting/editing comments
 YOUTUBE_CLIENT_ID = os.environ.get("YOUTUBE_CLIENT_ID", "")
 YOUTUBE_CLIENT_SECRET = os.environ.get("YOUTUBE_CLIENT_SECRET", "")

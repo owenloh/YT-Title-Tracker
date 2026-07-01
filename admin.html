@@ -103,7 +103,7 @@
     <label for="bulk">Comma-separated <code>@handle:Display Name</code> list (same format as YOUTUBE_CHANNELS)</label>
     <textarea id="bulk" placeholder="@MrBeast:MrBeast,@MarkRober:Mark Rober,..."></textarea>
     <div style="margin-top:10px"><button onclick="bulkImport()">Import list</button></div>
-    <div class="hint">Runs in the background (resolving handles one at a time) — refresh the table below to watch channels appear.</div>
+    <div class="hint">Already-tracked channels are left untouched (history kept); new ones start tracking from today. New uploads are picked up on the next poll.</div>
     <div id="bulkMsg" class="msg"></div>
   </div>
 
@@ -237,11 +237,12 @@ async function bulkImport(){
   const list = document.getElementById('bulk').value.trim();
   const msg = document.getElementById('bulkMsg');
   if(!list){ msg.className='msg err'; msg.textContent='Paste a list first.'; return; }
-  msg.className='msg'; msg.textContent='Queuing…';
+  msg.className='msg'; msg.textContent='Importing…';
   try{
     const data = await api('/api/admin/channels/bulk', {method:'POST', body: JSON.stringify({list})});
-    msg.className='msg ok'; msg.textContent = `Queued ${data.queued} channel(s) — importing in the background, refresh the table below periodically.`;
+    msg.className='msg ok'; msg.textContent = `Done — ${data.new} new channel(s) added, ${data.submitted - data.new} already tracked.`;
     document.getElementById('bulk').value='';
+    loadChannels();
   }catch(e){
     msg.className='msg err'; msg.textContent = e.message;
   }
