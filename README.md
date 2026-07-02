@@ -49,10 +49,18 @@ youtube_innertube.py # InnerTube client: identity-rotating title sampler
 youtube_comment.py   # YouTube API for comments
 config.py            # Environment settings
 dashboard_api.py     # Flask API endpoints
-dashboard.html       # Web dashboard UI
+dashboard.html       # Web dashboard UI (dark "instrument" theme + anime.js motion)
+admin.html           # Channel management UI (same theme)
+static/              # Self-hosted front-end assets (served at /static by Flask)
+  anime.min.js       #   anime.js (vendored, MIT) — powers count-ups, bar fills, reveals
+  fonts/             #   Space Grotesk + IBM Plex Mono woff2 (vendored, OFL)
 get_refresh_token.py # OAuth setup helper
 test_logic.py        # Unit tests for the pure (no network/DB) logic
 ```
+
+The front end is fully self-hosted: anime.js and the webfonts live under `static/`
+so nothing loads from a CDN, which keeps the strict `Content-Security-Policy`
+(`script-src 'self'`, `default-src 'self'`) intact — no external runtime deps.
 
 ## Setup
 

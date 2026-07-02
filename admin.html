@@ -4,82 +4,129 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Channel Admin — Youtube Title Tracker</title>
-<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxMDAgMTAwIj48ZGVmcz48bGluZWFyR3JhZGllbnQgaWQ9ImciIHgxPSIwIiB5MT0iMCIgeDI9IjEiIHkyPSIxIj48c3RvcCBvZmZzZXQ9IjAiIHN0b3AtY29sb3I9IiM2MzY2ZjEiLz48c3RvcCBvZmZzZXQ9IjEiIHN0b3AtY29sb3I9IiM4YjVjZjYiLz48L2xpbmVhckdyYWRpZW50PjwvZGVmcz48cmVjdCB3aWR0aD0iMTAwIiBoZWlnaHQ9IjEwMCIgcng9IjI2IiBmaWxsPSJ1cmwoI2cpIi8+PHBhdGggZD0iTTQxIDMxIEw0MSA2OSBMNzEgNTAgWiIgZmlsbD0iI2ZmZiIvPjwvc3ZnPgo=">
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxMDAgMTAwIj48cmVjdCB3aWR0aD0iMTAwIiBoZWlnaHQ9IjEwMCIgcng9IjIyIiBmaWxsPSIjMTIxMzE3Ii8+PHJlY3QgeD0iMjYiIHk9IjUyIiB3aWR0aD0iMTAiIGhlaWdodD0iMjIiIHJ4PSIzIiBmaWxsPSIjZThhMzNkIi8+PHJlY3QgeD0iNDUiIHk9IjMyIiB3aWR0aD0iMTAiIGhlaWdodD0iNDIiIHJ4PSIzIiBmaWxsPSIjZThhMzNkIi8+PHJlY3QgeD0iNjQiIHk9IjQyIiB3aWR0aD0iMTAiIGhlaWdodD0iMzIiIHJ4PSIzIiBmaWxsPSIjZThhMzNkIi8+PC9zdmc+">
 <style>
+  @font-face{font-family:'Space Grotesk';font-style:normal;font-weight:400;font-display:swap;src:local('Space Grotesk'),url('/static/fonts/sg-400.woff2') format('woff2')}
+  @font-face{font-family:'Space Grotesk';font-style:normal;font-weight:500;font-display:swap;src:local('Space Grotesk Medium'),url('/static/fonts/sg-500.woff2') format('woff2')}
+  @font-face{font-family:'Space Grotesk';font-style:normal;font-weight:700;font-display:swap;src:local('Space Grotesk Bold'),url('/static/fonts/sg-700.woff2') format('woff2')}
+  @font-face{font-family:'IBM Plex Mono';font-style:normal;font-weight:400;font-display:swap;src:local('IBM Plex Mono'),url('/static/fonts/plex-400.woff2') format('woff2')}
+  @font-face{font-family:'IBM Plex Mono';font-style:normal;font-weight:500;font-display:swap;src:local('IBM Plex Mono Medium'),url('/static/fonts/plex-500.woff2') format('woff2')}
+  @font-face{font-family:'IBM Plex Mono';font-style:normal;font-weight:600;font-display:swap;src:local('IBM Plex Mono SemiBold'),url('/static/fonts/plex-600.woff2') format('woff2')}
+
   :root{
-    --bg:#f5f6f8; --surface:#ffffff; --surface-2:#fbfbfc;
-    --border:#e9eaee; --border-strong:#dfe1e6;
-    --ink:#1b1d24; --muted:#6b7077; --faint:#9aa0a8;
-    --accent:#6366f1; --accent-soft:#eef0fe;
-    --green:#16a34a; --green-bg:#e7f6ec;
-    --red:#dc2626; --red-bg:#fceaea;
-    --shadow:0 1px 2px rgba(16,18,28,.04), 0 2px 6px rgba(16,18,28,.05);
-    --radius:14px;
+    --bg:#0b0c0e; --panel:#121317; --panel-2:#16181d; --raise:#1b1e24;
+    --line:#24262d; --line-soft:#1b1d22;
+    --ink:#ecead9; --ink-2:#c9c8bd; --muted:#93949c; --faint:#61636b;
+    --accent:#e8a33d; --accent-2:#f0b25a; --accent-ink:#1a1206; --accent-glow:rgba(232,163,61,.18);
+    --green:#43d17f; --red:#e0675f;
+    --shadow:0 1px 0 rgba(255,255,255,.02) inset, 0 8px 24px rgba(0,0,0,.35);
+    --radius:13px;
+    --sans:'Space Grotesk',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;
+    --mono:'IBM Plex Mono',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
   }
   *{margin:0;padding:0;box-sizing:border-box}
+  html{background:var(--bg)}
   body{
-    font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;
-    background:var(--bg); color:var(--ink); line-height:1.45; padding:28px 22px 60px;
+    font-family:var(--sans); background:var(--bg); color:var(--ink);
+    -webkit-font-smoothing:antialiased; line-height:1.45; padding:30px 22px 70px; position:relative; min-height:100vh;
   }
-  .wrap{max-width:1180px;margin:0 auto}
-  header{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:22px;flex-wrap:wrap}
-  h1{font-size:20px;font-weight:700;letter-spacing:-.02em}
-  h1 a{color:var(--muted);font-size:13px;font-weight:500;margin-left:12px;text-decoration:none}
-  h1 a:hover{color:var(--accent)}
+  body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;
+    background:
+      radial-gradient(1100px 520px at 78% -12%, rgba(232,163,61,.05), transparent 70%),
+      linear-gradient(rgba(236,234,217,.018) 1px,transparent 1px) 0 0/100% 46px;}
+  body::after{content:"";position:fixed;left:0;right:0;top:0;height:2px;z-index:3;
+    background:linear-gradient(90deg,transparent,var(--accent) 22%,var(--accent-2) 50%,var(--accent) 78%,transparent);opacity:.7}
+  .wrap{max-width:1200px;margin:0 auto;position:relative;z-index:1}
 
-  .panel{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);padding:20px;margin-bottom:18px}
-  .panel h2{font-size:14px;margin-bottom:12px}
-  label{font-size:12.5px;color:var(--muted);display:block;margin-bottom:5px}
+  header{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:24px;flex-wrap:wrap}
+  .brand{display:flex;align-items:center;gap:14px}
+  .mark{width:38px;height:38px;border-radius:10px;background:var(--panel-2);border:1px solid var(--line);
+    display:flex;align-items:flex-end;justify-content:center;gap:3px;padding:9px 8px;flex:none;box-shadow:var(--shadow)}
+  .mark i{width:3.5px;border-radius:2px;background:var(--accent);box-shadow:0 0 8px var(--accent-glow)}
+  .mark i:nth-child(1){height:42%} .mark i:nth-child(2){height:100%} .mark i:nth-child(3){height:64%}
+  h1{font-size:16px;font-weight:700;letter-spacing:.14em;text-transform:uppercase}
+  .brand .sub{font-family:var(--mono);font-size:11px;color:var(--muted);margin-top:3px;letter-spacing:.01em}
+  .back{font-family:var(--mono);font-size:11.5px;color:var(--muted);text-decoration:none;letter-spacing:.02em;
+    padding:8px 12px;border:1px solid var(--line);border-radius:9px;background:var(--panel);transition:.16s}
+  .back:hover{color:var(--ink);background:var(--raise);transform:translateY(-1px)}
+
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);padding:22px;margin-bottom:18px}
+  .panel h2{font-family:var(--mono);font-size:11px;font-weight:500;letter-spacing:.16em;text-transform:uppercase;color:var(--faint);margin-bottom:15px;display:flex;align-items:center;gap:8px}
+  .panel h2::before{content:"";width:5px;height:5px;border-radius:1px;background:var(--accent);box-shadow:0 0 8px var(--accent-glow)}
+  label{font-family:var(--mono);font-size:11px;color:var(--muted);display:block;margin-bottom:7px;letter-spacing:.02em}
   input[type=text], input[type=password], textarea{
-    width:100%;padding:9px 11px;border:1px solid var(--border-strong);border-radius:9px;
-    font-size:13.5px;font-family:inherit;background:var(--surface-2);color:var(--ink);
+    width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:9px;
+    font-size:13.5px;font-family:var(--mono);background:var(--bg);color:var(--ink);transition:.16s;
   }
-  textarea{min-height:90px;resize:vertical;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px}
+  input:focus, textarea:focus{outline:0;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-glow)}
+  input::placeholder, textarea::placeholder{color:var(--faint)}
+  textarea{min-height:96px;resize:vertical;font-size:12.5px;line-height:1.6}
   button{
-    border:0;background:var(--accent);color:#fff;font-weight:600;font-size:13px;
-    padding:9px 16px;border-radius:9px;cursor:pointer;font-family:inherit;
+    border:1px solid var(--accent);background:var(--accent);color:var(--accent-ink);font-family:var(--mono);font-weight:600;font-size:12.5px;letter-spacing:.02em;
+    padding:10px 18px;border-radius:9px;cursor:pointer;transition:.16s;
   }
-  button:hover{opacity:.92}
-  button.secondary{background:var(--surface-2);color:var(--ink);border:1px solid var(--border-strong)}
-  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}
+  button:hover{background:var(--accent-2);border-color:var(--accent-2);transform:translateY(-1px)}
+  button.secondary{background:var(--panel);color:var(--ink-2);border:1px solid var(--line)}
+  button.secondary:hover{background:var(--raise);color:var(--ink);border-color:var(--line)}
+  .row{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end}
   .row > div{flex:1;min-width:180px}
-  .msg{font-size:12.5px;margin-top:10px}
+  .msg{font-family:var(--mono);font-size:11.5px;margin-top:12px;letter-spacing:.01em;color:var(--muted)}
   .msg.ok{color:var(--green)} .msg.err{color:var(--red)}
+  code{font-family:var(--mono);background:var(--bg);border:1px solid var(--line);padding:1px 5px;border-radius:4px;font-size:11.5px;color:var(--ink-2)}
 
+  .scroll{overflow-x:auto}
   table{width:100%;border-collapse:collapse;font-size:13px}
-  thead th{font-size:11px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--faint);
-        text-align:left;padding:10px 12px;background:var(--surface-2);border-bottom:1px solid var(--border)}
-  tbody td{padding:10px 12px;border-bottom:1px solid var(--border);vertical-align:middle}
+  thead th{font-family:var(--mono);font-size:10.5px;font-weight:500;letter-spacing:.13em;text-transform:uppercase;color:var(--faint);
+    text-align:left;padding:12px 14px;background:var(--panel-2);border-bottom:1px solid var(--line);white-space:nowrap}
+  tbody td{padding:12px 14px;border-bottom:1px solid var(--line-soft);vertical-align:middle}
   tbody tr:last-child td{border-bottom:0}
-  .name{font-weight:600}
-  .num{font-variant-numeric:tabular-nums}
-  .muted{color:var(--muted)}
-  .switch{position:relative;display:inline-block;width:38px;height:22px}
+  tbody tr{transition:background .14s}
+  tbody tr:hover{background:var(--panel-2)}
+  .name{font-weight:500;color:var(--ink)}
+  .num{font-family:var(--mono);font-variant-numeric:tabular-nums;color:var(--ink-2)}
+  .muted{color:var(--muted);font-family:var(--mono);font-size:12px}
+
+  .switch{position:relative;display:inline-block;width:40px;height:23px}
   .switch input{opacity:0;width:0;height:0}
-  .slider{position:absolute;cursor:pointer;inset:0;background:var(--border-strong);border-radius:999px;transition:.15s}
-  .slider::before{content:"";position:absolute;height:16px;width:16px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.15s}
-  input:checked + .slider{background:var(--green)}
-  input:checked + .slider::before{transform:translateX(16px)}
-  .gate{max-width:360px;margin:80px auto;text-align:center}
-  .gate h1{margin-bottom:16px}
+  .slider{position:absolute;cursor:pointer;inset:0;background:var(--line);border:1px solid var(--line);border-radius:999px;transition:.18s}
+  .slider::before{content:"";position:absolute;height:15px;width:15px;left:3px;top:3px;background:var(--muted);border-radius:50%;transition:.18s}
+  input:checked + .slider{background:var(--accent-glow);border-color:var(--accent)}
+  input:checked + .slider::before{transform:translateX(17px);background:var(--accent);box-shadow:0 0 8px var(--accent-glow)}
+  input:disabled + .slider{opacity:.5;cursor:default}
+
+  .gate{max-width:380px;margin:14vh auto 0;text-align:left}
+  .gate .mark{margin:0 auto 18px}
+  .gate h1{text-align:center;margin-bottom:20px;letter-spacing:.14em}
   .hidden{display:none}
-  .hint{font-size:12px;color:var(--faint);margin-top:6px}
+  .hint{font-family:var(--mono);font-size:11px;color:var(--faint);margin-top:9px;letter-spacing:.01em;line-height:1.6}
+  .refresh-row{display:flex;align-items:center;gap:12px;margin-bottom:8px}
+  .refresh-row h2{margin:0}
 </style>
 </head>
 <body>
 
 <div id="gate" class="gate panel">
+  <div class="mark"><i></i><i></i><i></i></div>
   <h1>Channel Admin</h1>
   <label for="token">Admin password</label>
-  <input type="password" id="token" placeholder="Paste the admin token">
-  <div style="margin-top:10px"><button onclick="unlock()">Unlock</button></div>
+  <input type="password" id="token" placeholder="Paste the admin token" onkeydown="if(event.key==='Enter')unlock()">
+  <div style="margin-top:14px"><button onclick="unlock()">Unlock →</button></div>
   <div id="gateMsg" class="msg err"></div>
 </div>
 
 <div id="app" class="wrap hidden">
   <header>
-    <h1>Channel Admin <a href="/">← Dashboard</a></h1>
-    <button class="secondary" onclick="logout()">Lock</button>
+    <div class="brand">
+      <div class="mark"><i></i><i></i><i></i></div>
+      <div>
+        <h1>Channel Admin</h1>
+        <div class="sub">Manage tracked channels &amp; tracking state</div>
+      </div>
+    </div>
+    <div style="display:flex;align-items:center;gap:10px">
+      <a href="/" class="back">← Dashboard</a>
+      <button class="secondary" onclick="logout()">Lock</button>
+    </div>
   </header>
 
   <div class="panel">
@@ -103,17 +150,17 @@
     <h2>Bulk import</h2>
     <label for="bulk">Comma-separated <code>@handle:Display Name</code> list (same format as YOUTUBE_CHANNELS)</label>
     <textarea id="bulk" placeholder="@MrBeast:MrBeast,@MarkRober:Mark Rober,..."></textarea>
-    <div style="margin-top:10px"><button onclick="bulkImport()">Import list</button></div>
+    <div style="margin-top:12px"><button onclick="bulkImport()">Import list</button></div>
     <div class="hint">Already-tracked channels are left untouched (history kept); new ones start tracking from today. New uploads are picked up on the next poll.</div>
     <div id="bulkMsg" class="msg"></div>
   </div>
 
   <div class="panel">
-    <div class="row" style="margin-bottom:6px">
-      <h2 style="margin:0">Channels</h2>
+    <div class="refresh-row">
+      <h2>Channels</h2>
       <div style="flex:0 0 auto"><button class="secondary" onclick="loadChannels()">Refresh</button></div>
     </div>
-    <div class="scroll" style="overflow-x:auto">
+    <div class="scroll">
       <table>
         <thead>
           <tr>
