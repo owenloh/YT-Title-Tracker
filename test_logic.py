@@ -334,6 +334,22 @@ class TestTrackingAgeCap(unittest.TestCase):
         import main
         self.main = main
 
+    def test_age_helper(self):
+        from datetime import datetime, timedelta, timezone
+        m = self.main
+        orig, m.MAX_TRACK_DAYS = m.MAX_TRACK_DAYS, 7
+        try:
+            self.assertTrue(m._past_tracking_age(datetime.now() - timedelta(days=8)))
+            self.assertFalse(m._past_tracking_age(datetime.now() - timedelta(days=2)))
+            self.assertFalse(m._past_tracking_age(None))
+            # An aware datetime must not raise -- RSS parsing has produced them.
+            self.assertTrue(m._past_tracking_age(
+                datetime.now(timezone.utc) - timedelta(days=30)))
+            m.MAX_TRACK_DAYS = 0  # cap disabled
+            self.assertFalse(m._past_tracking_age(datetime.now() - timedelta(days=999)))
+        finally:
+            m.MAX_TRACK_DAYS = orig
+
     def test_video_past_the_cap_is_retired_without_sampling(self):
         from datetime import datetime, timedelta
         m = self.main

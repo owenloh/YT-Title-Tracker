@@ -76,6 +76,23 @@ from youtube_comment import fetch_comment_meta, post_comment, update_comment
 # SCHEDULER_WORKERS to give headroom as more channels are tracked.
 executor = ThreadPoolExecutor(max_workers=SCHEDULER_WORKERS)
 
+def _past_tracking_age(published_at) -> bool:
+    """Whether a video is older than MAX_TRACK_DAYS (0 disables the cap).
+
+    INACTIVE_DAYS_THRESHOLD only retires videos that settled on ONE title, and
+    it needs a run of consecutive sampled days to fire at all -- so a video with
+    gaps in its sampling history, or a test that keeps flip-flopping, stayed in
+    the active set indefinitely. This is the backstop.
+    """
+    if MAX_TRACK_DAYS <= 0 or published_at is None:
+        return False
+    # Stored as a naive TIMESTAMP, but RSS parsing has produced aware datetimes
+    # before -- compare on the same footing either way.
+    if published_at.tzinfo is not None:
+        published_at = published_at.replace(tzinfo=None)
+    return (datetime.now() - published_at).days >= MAX_TRACK_DAYS
+
+
 def _commenting_allowed() -> bool:
     """Whether a comment may be posted or edited right now.
 
@@ -113,24 +130,44 @@ def _release_memory() -> None:
 
 
 def reprocess_videos_without_comments():
-    """Find and reprocess any active videos that don't have comments yet."""
+    """Re-sample active videos that never got a comment, so they can earn one.
+
+    Runs once at startup. Its only purpose is backfilling a MISSING COMMENT, so
+    it is skipped entirely when commenting is off -- otherwise every restart
+    kicked off a sampling burst for every commentless video to produce a comment
+    that would never be posted, which is the most expensive thing this process
+    does and it happens on every redeploy.
+    """
     if not operations_enabled():
         print("Tracking is paused - skipping reprocess of videos without comments")
+        return
+    if not _commenting_allowed():
+        print("Commenting is off - skipping reprocess of videos without comments")
         return
     videos = get_videos_without_comments()
     if not videos:
         print("No videos without comments to reprocess")
         return
-    
+
     print(f"Found {len(videos)} videos without comments - reprocessing...")
+    spawned = 0
     for video in videos:
         video_id = video["video_id"]
         channel_id = video["channel_id"]
         channel_name = video["channel_name"]
         published_at = video["published_at"]
-        
+
+        # Same age cap the hourly sweep applies. Without it, a restart re-sampled
+        # the entire backlog of old commentless videos -- videos whose title test
+        # is long over -- before the sweep ever got a chance to retire them.
+        if _past_tracking_age(published_at):
+            mark_video_inactive(video_id)
+            continue
+
         executor.submit(process_video, video_id, channel_id, channel_name, published_at)
+        spawned += 1
         print(f"[{channel_name}] Spawned reprocess task for {video_id}")
+    print(f"Reprocess: {spawned} spawned, {len(videos) - spawned} retired as too old")
 
 
 _MAX_VARIANTS_SHOWN = 6
@@ -492,18 +529,11 @@ def _check_one_active_video(video_info: dict, refresh_meta: bool = True) -> None
         # so a video whose experiment keeps flip-flopping stayed in the active
         # set indefinitely and the sweep grew without bound. Title experiments
         # are decided within days of upload; MAX_TRACK_DAYS = 0 disables this.
-        published_at = video_info.get("published_at")
-        if MAX_TRACK_DAYS > 0 and published_at is not None:
-            # Stored as a naive TIMESTAMP, but RSS parsing has produced aware
-            # datetimes before -- compare on the same footing either way.
-            if published_at.tzinfo is not None:
-                published_at = published_at.replace(tzinfo=None)
-            age_days = (datetime.now() - published_at).days
-            if age_days >= MAX_TRACK_DAYS:
-                print(f"[{channel_name}] {video_id} is {age_days}d old "
-                      f"(cap {MAX_TRACK_DAYS}d) - marking inactive")
-                mark_video_inactive(video_id)
-                return
+        if _past_tracking_age(video_info.get("published_at")):
+            print(f"[{channel_name}] {video_id} is past the {MAX_TRACK_DAYS}d "
+                  f"tracking cap - marking inactive")
+            mark_video_inactive(video_id)
+            return
 
         # Stagnated (same single title for N days straight) -> stop tracking.
         # The comment already reflects the latest titles from prior checks, so
