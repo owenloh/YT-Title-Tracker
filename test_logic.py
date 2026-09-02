@@ -327,6 +327,88 @@ class TestCommentingGate(unittest.TestCase):
         self.assertFalse(self.m._commenting_allowed())
 
 
+class TestSamplingProfiles(unittest.TestCase):
+    """The runtime fast/relaxed switch and the gate it resizes."""
+
+    def test_profiles_differ_in_the_direction_advertised(self):
+        import config
+        fast = config.profile_settings("fast")
+        relaxed = config.profile_settings("relaxed")
+        self.assertLess(fast["new_video_check_interval"], relaxed["new_video_check_interval"])
+        self.assertLess(fast["active_video_check_interval"], relaxed["active_video_check_interval"])
+        self.assertGreater(fast["samples_per_run"], relaxed["samples_per_run"])
+        self.assertGreater(fast["fast_samples"], relaxed["fast_samples"])
+        self.assertGreaterEqual(fast["sample_concurrency"], relaxed["sample_concurrency"])
+
+    def test_unknown_profile_falls_back_to_the_default(self):
+        import config
+        self.assertEqual(config.profile_settings("nonsense"),
+                         config.SAMPLING_PROFILES[config.DEFAULT_SAMPLING_PROFILE])
+
+    def test_stored_garbage_falls_back(self):
+        import storage
+        orig = storage.get_setting
+        try:
+            for raw in ("turbo", "", None):
+                storage.get_setting = lambda k, d=None, r=raw: r if r is not None else d
+                storage._settings_cache.clear()
+                self.assertEqual(storage.sampling_profile(),
+                                 storage.DEFAULT_SAMPLING_PROFILE, raw)
+        finally:
+            storage.get_setting = orig
+            storage._settings_cache.clear()
+
+    def test_set_rejects_unknown_name(self):
+        import storage
+        with self.assertRaises(ValueError):
+            storage.set_sampling_profile("ludicrous")
+
+    def test_scheduler_reads_the_live_profile(self):
+        import main, config, storage
+        orig = storage.get_setting
+        try:
+            storage.get_setting = lambda k, d=None: "fast"
+            storage._settings_cache.clear()
+            self.assertEqual(main._sampling(), config.profile_settings("fast"))
+            storage.get_setting = lambda k, d=None: "relaxed"
+            storage._settings_cache.clear()
+            self.assertEqual(main._sampling(), config.profile_settings("relaxed"))
+        finally:
+            storage.get_setting = orig
+            storage._settings_cache.clear()
+
+    def test_gate_caps_concurrency_and_can_be_resized(self):
+        """A plain Semaphore cannot grow, which is why _Gate exists."""
+        import threading, time
+        import youtube_innertube as it
+
+        def peak_under(gate, limit, threads=10):
+            gate.set_limit(limit)
+            state = {"now": 0, "peak": 0}
+            lock = threading.Lock()
+
+            def work():
+                with gate:
+                    with lock:
+                        state["now"] += 1
+                        state["peak"] = max(state["peak"], state["now"])
+                    time.sleep(0.02)
+                    with lock:
+                        state["now"] -= 1
+
+            ts = [threading.Thread(target=work) for _ in range(threads)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+            return state["peak"]
+
+        gate = it._Gate(2)
+        self.assertEqual(peak_under(gate, 2), 2)
+        self.assertEqual(peak_under(gate, 5), 5)   # raised past its initial value
+        self.assertEqual(peak_under(gate, 1), 1)   # and back down
+
+
 class TestTrackingAgeCap(unittest.TestCase):
     """MAX_TRACK_DAYS retires videos the stagnation rule would keep forever."""
 

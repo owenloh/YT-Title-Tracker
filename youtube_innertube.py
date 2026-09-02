@@ -47,7 +47,7 @@ from typing import List, Optional, Set
 
 import requests
 
-from config import SAMPLE_CONCURRENCY
+from config import MAX_SAMPLE_CONCURRENCY, SAMPLE_CONCURRENCY
 
 _INNERTUBE_URL = "https://www.youtube.com/youtubei/v1/{endpoint}?prettyPrint=false"
 # Public InnerTube key used by the YouTube web client. Not a secret -- it ships
@@ -166,6 +166,43 @@ def _headers(client_key: str) -> dict:
     }
 
 
+class _Gate:
+    """A semaphore whose limit can be raised or lowered while it is in use.
+
+    threading.Semaphore cannot grow past its initial value, and the sampling
+    profile toggle changes the ceiling at runtime, so this tracks the limit
+    explicitly. Lowering it never interrupts work already in flight -- holders
+    just aren't replaced until the count falls back under the new limit.
+    """
+
+    def __init__(self, limit: int):
+        self._cond = threading.Condition()
+        self._limit = max(1, limit)
+        self._active = 0
+
+    def set_limit(self, limit: int) -> None:
+        with self._cond:
+            self._limit = max(1, limit)
+            self._cond.notify_all()
+
+    @property
+    def limit(self) -> int:
+        return self._limit
+
+    def __enter__(self):
+        with self._cond:
+            while self._active >= self._limit:
+                self._cond.wait()
+            self._active += 1
+        return self
+
+    def __exit__(self, *exc):
+        with self._cond:
+            self._active -= 1
+            self._cond.notify()
+        return False
+
+
 # Process-wide ceiling on concurrent InnerTube requests.
 #
 # Memory, not CPU or rate limiting, is why this exists. A /next response is a
@@ -174,15 +211,25 @@ def _headers(client_key: str) -> dict:
 # the same instant, and CPython does not hand that memory back to the OS
 # afterwards. Sampling used to create a fresh ThreadPoolExecutor(8) per video
 # with no global bound, so a sweep over N videos ran 8N parses concurrently and
-# pinned the deployment's high-water mark at gigabytes. One shared semaphore
-# caps it regardless of how many videos are being sampled at once.
-_sample_gate = threading.Semaphore(max(1, SAMPLE_CONCURRENCY))
+# pinned the deployment's high-water mark at gigabytes. One shared gate caps it
+# regardless of how many videos are being sampled at once, at whatever ceiling
+# the active sampling profile asks for.
+_sample_gate = _Gate(SAMPLE_CONCURRENCY)
+
+
+def set_sample_concurrency(limit: int) -> None:
+    """Change the global sampling ceiling (called when the profile changes)."""
+    _sample_gate.set_limit(limit)
+
+
+def sample_concurrency() -> int:
+    return _sample_gate.limit
 
 # One shared connection pool for every sampling thread. Without it each request
 # opened (and TLS-handshook) its own connection.
 _session = requests.Session()
 _session.mount("https://", requests.adapters.HTTPAdapter(
-    pool_connections=4, pool_maxsize=max(4, SAMPLE_CONCURRENCY * 2), max_retries=0,
+    pool_connections=4, pool_maxsize=max(4, MAX_SAMPLE_CONCURRENCY * 2), max_retries=0,
 ))
 
 
@@ -266,7 +313,7 @@ def sample_variant_titles(video_id: str, samples: int = 40, delay: float = 0.8,
         # Worker count is capped by the same global ceiling as the requests
         # themselves: extra threads beyond it would only queue on _sample_gate
         # while each holding a stack.
-        workers = max(1, min(samples, SAMPLE_CONCURRENCY))
+        workers = max(1, min(samples, _sample_gate.limit))
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futures = [
                 ex.submit(_sample_once, video_id, _CLIENT_KEYS[i % len(_CLIENT_KEYS)])

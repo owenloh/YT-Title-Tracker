@@ -114,6 +114,9 @@
   .master-label{font-size:16px;font-weight:700;letter-spacing:.02em}
   .master-sub{font-family:var(--mono);font-size:11.5px;color:var(--muted);margin-top:3px}
   .sub-switch{margin-top:16px;padding-top:16px;border-top:1px solid var(--line-soft)}
+  .warn{margin-top:12px;padding:11px 13px;border-radius:9px;border:1px solid rgba(232,163,61,.38);
+    background:var(--accent-glow);font-family:var(--mono);font-size:11.5px;line-height:1.65;color:var(--ink-2)}
+  .warn b{color:var(--accent);font-weight:600}
   .switch.big{width:56px;height:31px}
   .switch.big .slider::before{height:21px;width:21px;left:4px;top:4px}
   .switch.big input:checked + .slider::before{transform:translateX(25px)}
@@ -175,11 +178,27 @@
       </label>
     </div>
 
+    <div class="master-row sub-switch">
+      <div class="master-state">
+        <span class="dot" id="speedDot"></span>
+        <div>
+          <div class="master-label" style="font-size:14px">Fast sampling</div>
+          <div class="master-sub" id="speedSub">&nbsp;</div>
+        </div>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="speedToggle" disabled onchange="toggleSpeed(this)">
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="warn" id="speedWarn" hidden></div>
+
     <div class="hint">
       <strong>Tracking</strong> is the kill switch for all outbound work: channel polling,
       title sampling and comment posting/editing. <strong>Post comments</strong> is the
       narrower one — it stops writing to YouTube while title sampling and the dashboard
-      carry on. The dashboard and its history stay online either way.<br>
+      carry on. <strong>Fast sampling</strong> restores the original aggressive cadence —
+      more requests, same bounded memory. The dashboard and its history stay online either way.<br>
       Separate from the per-channel toggles below, which are left exactly as they are.
       Switching back on resumes from that day forward: nothing published during the pause
       is backfilled or commented on.
@@ -282,6 +301,46 @@ function esc(s){ return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>
 function fmtDate(d){ return d ? new Date(d).toLocaleDateString(undefined,{year:'numeric',month:'short',day:'numeric'}) : '—'; }
 function fmtNum(n){ return (Math.round((n||0)*10)/10).toString(); }
 
+function fmtSecs(sec){
+  if(sec % 3600 === 0) return (sec/3600) + ' h';
+  if(sec % 60 === 0)   return (sec/60) + ' min';
+  return sec + ' s';
+}
+
+// Requests per video per day, so the two profiles can be compared honestly
+// rather than with a hand-wavy "uses more".
+function dailySamples(p){ return (86400 / p.active_video_check_interval) * p.samples_per_run; }
+
+function renderSpeed(profile, profiles){
+  const fast = profile === 'fast';
+  const p = profiles[profile] || {};
+  document.getElementById('speedDot').className = 'dot ' + (fast ? 'on' : '');
+  document.getElementById('speedSub').textContent = p.new_video_check_interval
+    ? `Checks feeds every ${fmtSecs(p.new_video_check_interval)}, re-samples every `
+      + `${fmtSecs(p.active_video_check_interval)}, ${p.samples_per_run} samples a sweep `
+      + `(${p.fast_samples} on a new video)`
+    : '';
+  const box = document.getElementById('speedToggle');
+  box.checked = fast;
+  box.disabled = false;
+
+  const warn = document.getElementById('speedWarn');
+  const r = profiles.relaxed, f = profiles.fast;
+  if(fast && r && f){
+    const sampleX = Math.round(dailySamples(f) / dailySamples(r));
+    const feedX   = Math.round(r.new_video_check_interval / f.new_video_check_interval);
+    warn.innerHTML = `<b>Fast sampling is on.</b> Roughly <b>${sampleX}×</b> the sampling `
+      + `requests and <b>${feedX}×</b> the feed checks of relaxed mode. `
+      + `Peak memory is still capped (${f.sample_concurrency} concurrent requests vs `
+      + `${r.sample_concurrency}), so this costs request volume and a little CPU — `
+      + `not the runaway memory that used to drive the bill. Switch it back when the `
+      + `videos you care about have settled.`;
+    warn.hidden = false;
+  } else {
+    warn.hidden = true;
+  }
+}
+
 function renderCommenting(on, forcedOff){
   const box = document.getElementById('commentToggle');
   document.getElementById('commentDot').className = 'dot ' + (on ? 'on' : 'off');
@@ -312,9 +371,30 @@ async function loadMaster(){
     const d = await api('/api/admin/operations');
     renderMaster(!!d.enabled, d.changed_at);
     renderCommenting(!!d.commenting && !d.commenting_forced_off, !!d.commenting_forced_off);
+    renderSpeed(d.sampling_profile, d.sampling_profiles || {});
   }catch(e){
     document.getElementById('masterLabel').textContent = 'Unknown';
     document.getElementById('masterSub').textContent = 'Could not read tracking state';
+  }
+}
+
+async function toggleSpeed(box){
+  const profile = box.checked ? 'fast' : 'relaxed';
+  const msg = document.getElementById('masterMsg');
+  box.disabled = true;
+  msg.className = 'msg'; msg.textContent = 'Saving…';
+  try{
+    await api('/api/admin/operations', {method:'POST', body: JSON.stringify({sampling_profile: profile})});
+    msg.className = 'msg ok';
+    msg.textContent = profile === 'fast'
+      ? 'Fast sampling on — applies from the next sweep (~15s).'
+      : 'Back to relaxed sampling.';
+    await loadMaster();
+  }catch(e){
+    msg.className = 'msg err'; msg.textContent = 'Failed: ' + e.message;
+    box.checked = profile !== 'fast';
+  }finally{
+    box.disabled = false;
   }
 }
 

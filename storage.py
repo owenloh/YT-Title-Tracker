@@ -9,7 +9,14 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from psycopg2.pool import ThreadedConnectionPool
 
-from config import DATABASE_URL, DB_POOL_MAX, RATIO_WINDOW_DAYS, SCHEDULER_WORKERS
+from config import (
+    DATABASE_URL,
+    DB_POOL_MAX,
+    DEFAULT_SAMPLING_PROFILE,
+    RATIO_WINDOW_DAYS,
+    SAMPLING_PROFILES,
+    SCHEDULER_WORKERS,
+)
 
 # Connection pool. MUST be the *threaded* pool: the scheduler runs many worker
 # threads and Flask serves requests on its own threads, all sharing this pool.
@@ -200,6 +207,7 @@ def init_db():
 # ---------------------------------------------------------------------------
 OPERATIONS_ENABLED_KEY = "operations_enabled"
 COMMENTING_ENABLED_KEY = "commenting_enabled"
+SAMPLING_PROFILE_KEY = "sampling_profile"
 
 # Values that read as "off" in a stored switch. Everything else, including an
 # unset key, means on -- so a deployment that has never seen a switch behaves
@@ -300,6 +308,25 @@ def commenting_enabled() -> bool:
 
 def set_commenting_enabled(enabled: bool) -> None:
     set_setting(COMMENTING_ENABLED_KEY, "1" if enabled else "0")
+
+
+def sampling_profile() -> str:
+    """Which sampling speed is active ("relaxed" or "fast").
+
+    Runtime-switchable like the other switches, so the aggressive cadence can be
+    turned on for a while (a launch worth watching closely) and off again with
+    no redeploy. An unrecognised or unset value falls back to the default.
+    """
+    name = _cached_setting(SAMPLING_PROFILE_KEY, DEFAULT_SAMPLING_PROFILE).strip().lower()
+    return name if name in SAMPLING_PROFILES else DEFAULT_SAMPLING_PROFILE
+
+
+def set_sampling_profile(name: str) -> None:
+    """Set the active sampling profile. Raises ValueError on an unknown name."""
+    name = (name or "").strip().lower()
+    if name not in SAMPLING_PROFILES:
+        raise ValueError(f"unknown sampling profile: {name!r}")
+    set_setting(SAMPLING_PROFILE_KEY, name)
 
 
 def seed_setting_if_missing(key: str, value: str) -> None:

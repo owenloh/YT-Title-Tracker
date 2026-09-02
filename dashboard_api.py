@@ -24,7 +24,7 @@ from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-from config import SKIP_COMMENT, parse_channels_str
+from config import SAMPLING_PROFILES, SKIP_COMMENT, parse_channels_str, profile_settings
 from scraper import resolve_channel_id
 from storage import (
     add_channel_admin,
@@ -36,9 +36,11 @@ from storage import (
     get_video_info,
     init_db,
     operations_enabled,
+    sampling_profile,
     set_channel_enabled,
     set_commenting_enabled,
     set_operations_enabled,
+    set_sampling_profile,
     set_setting,
 )
 
@@ -335,6 +337,12 @@ def get_operations():
             # toggle. Report it so the UI can say the toggle is overridden rather
             # than appear to accept a change that has no effect.
             "commenting_forced_off": SKIP_COMMENT,
+            "sampling_profile": sampling_profile(),
+            # The concrete numbers behind each profile, so the UI can show what
+            # the choice actually costs instead of a vague "uses more".
+            "sampling_profiles": {
+                name: profile_settings(name) for name in SAMPLING_PROFILES
+            },
         })
     except Exception as e:
         return _server_error(e)
@@ -349,6 +357,9 @@ def set_operations():
     stops posting or editing comments -- while this web process keeps serving
     the dashboard, so the site and its history stay online.
 
+    Also accepts ``commenting`` (stop only the writes to YouTube) and
+    ``sampling_profile`` ("relaxed" or "fast" -- how hard the sampler works).
+
     This is a separate axis from the per-channel toggles and never touches them:
     the channel selection is preserved exactly as-is across a pause. Turning
     tracking back on moves every channel's cutoff to today (see
@@ -356,10 +367,21 @@ def set_operations():
     window is not backfilled.
     """
     body = request.get_json(silent=True) or {}
-    if "enabled" not in body and "commenting" not in body:
-        return jsonify({"error": "enabled or commenting is required"}), 400
+    keys = ("enabled", "commenting", "sampling_profile")
+    if not any(k in body for k in keys):
+        return jsonify({"error": f"one of {', '.join(keys)} is required"}), 400
 
     try:
+        if "sampling_profile" in body:
+            try:
+                set_sampling_profile(str(body["sampling_profile"]))
+            except ValueError:
+                return jsonify({
+                    "error": f"sampling_profile must be one of "
+                             f"{', '.join(sorted(SAMPLING_PROFILES))}"
+                }), 400
+            logger.warning("Sampling profile set to %s by admin from %s",
+                           body["sampling_profile"], _client_ip())
         if "commenting" in body:
             # Narrower switch: stop writing comments to YouTube while sampling
             # and the dashboard carry on.
@@ -378,6 +400,7 @@ def set_operations():
             "status": "ok",
             "enabled": operations_enabled(fresh=True),
             "commenting": commenting_enabled(),
+            "sampling_profile": sampling_profile(),
         })
     except Exception as e:
         return _server_error(e)

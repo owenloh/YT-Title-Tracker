@@ -13,8 +13,9 @@ with the historical title data.
 - Dashboard to view all tracked videos
 - Auto-detects when titles stabilize (marks inactive after 5 days)
 - Skips Shorts automatically
-- **Master switch** in the admin console to stop all tracking work while keeping
-  the site online (see [Running cost & the master switch](#running-cost--the-master-switch))
+- **Runtime switches** in the admin console — stop all tracking, stop only
+  commenting, or flip sampling speed — without a redeploy (see
+  [Running cost & the master switch](#running-cost--the-master-switch))
 
 ## How variant detection works
 
@@ -114,6 +115,7 @@ Dashboard available at your Railway public URL.
 | `SAMPLES_PER_RUN` | No | 15 | Title samples per video per sweep (cumulative across sweeps) |
 | `FAST_SAMPLES` | No | 30 | Quick samples before posting the first comment |
 | `SAMPLE_CONCURRENCY` | No | 4 | Max sampling requests in flight process-wide (caps peak memory) |
+| `FAST_MODE_*` | No | see table | Fast-profile overrides, e.g. `FAST_MODE_SAMPLES_PER_RUN` |
 | `SCHEDULER_WORKERS` | No | 6 | Scheduler thread-pool size |
 | `INACTIVE_DAYS_THRESHOLD` | No | 5 | Days of same title = finalized |
 | `MAX_TRACK_DAYS` | No | 7 | Stop sampling a video once it's this old (0 = no cap) |
@@ -141,9 +143,11 @@ What keeps it down:
 - `MALLOC_ARENA_MAX=2` in the start command stops glibc fragmenting the heap
   across per-thread arenas, and `malloc_trim` runs after each sweep.
 - `MAX_TRACK_DAYS` retires old videos, so the active set stops growing forever.
-- The polling cadences are slow (30 min discovery, 6-hourly re-sampling). They
-  were originally tuned to comment first; that is no longer the goal, and samples
-  accumulate across sweeps, so a slower cadence loses coverage, not accuracy.
+- The polling cadences are slow by default (30 min discovery, 6-hourly
+  re-sampling). They were originally tuned to comment first; that is no longer
+  the goal, and samples accumulate across sweeps, so a slower cadence costs time
+  to coverage, not accuracy. The old cadence is one toggle away when a particular
+  video is worth watching closely.
 
 ### Master switch
 
@@ -162,11 +166,36 @@ to YouTube (posting and editing) while title sampling and the dashboard carry on
 account is being spam-filtered, since sampling only reads public data whereas
 commenting is an automated write to other people's videos.
 
-Both live in the `app_settings` table (keys `operations_enabled` and
-`commenting_enabled`), so they survive restarts and redeploys and take effect
-within ~15 seconds without one. Unset means ON, so an existing deployment is
-unaffected until a switch is used. `SKIP_COMMENT` still works as a deploy-level
-kill switch that outranks the runtime toggle, and seeds it on first boot.
+### Sampling speed
+
+A third toggle, **Fast sampling**, switches between two profiles at runtime:
+
+| | Relaxed (default) | Fast |
+|---|---|---|
+| Feed check | every 30 min | every 3 min |
+| Re-sample sweep | every 6 h | every hour |
+| Samples per sweep | 15 | 40 |
+| Opening burst on a new video | 30 | 90 |
+| Concurrent requests | 4 | 8 |
+
+Fast is the original cadence: roughly **16× the sampling requests** and **10× the
+feed checks**. It is no longer a memory question — peak memory is capped by
+`sample_concurrency` in both profiles — so it costs request volume and a little
+CPU, not the runaway resident set that used to drive the bill. The admin UI shows
+these multipliers, computed from the live values, whenever fast mode is on.
+
+Each profile's numbers come from env vars: relaxed from the ones in the table
+above, fast from `FAST_MODE_`-prefixed equivalents (e.g.
+`FAST_MODE_SAMPLES_PER_RUN`).
+
+### Where the state lives
+
+All three switches live in the `app_settings` table (`operations_enabled`,
+`commenting_enabled`, `sampling_profile`), so they survive restarts and redeploys
+and take effect within ~15 seconds without one. Unset means ON / relaxed, so an
+existing deployment is unaffected until a switch is used. `SKIP_COMMENT` still
+works as a deploy-level kill switch that outranks the commenting toggle, and
+seeds it on first boot.
 
 ## Comment Format
 
@@ -193,8 +222,9 @@ Public (read-only — these power the dashboard website):
 Admin (requires the `ADMIN_TOKEN` secret):
 
 - `GET /api/admin/operations` - Master switch state
-- `POST /api/admin/operations` - Start/stop all tracking (`{"enabled": false}`)
-  and/or commenting only (`{"commenting": false}`)
+- `POST /api/admin/operations` - Start/stop all tracking (`{"enabled": false}`),
+  commenting only (`{"commenting": false}`), or sampling speed
+  (`{"sampling_profile": "fast"}`)
 - `GET /api/admin/channels`, `POST /api/admin/channels`,
   `POST /api/admin/channels/bulk`, `PATCH /api/admin/channels/<id>` - Channel management
 - `POST /api/reset` - Clear database. Send the token as `X-Admin-Token: <token>`

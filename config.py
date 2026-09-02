@@ -150,3 +150,55 @@ COMMENT_INTROS = [
 
 # Set to 1 to run without posting/updating YouTube comment
 SKIP_COMMENT = os.environ.get("SKIP_COMMENT", "0").strip().lower() in ("1", "true", "yes")
+
+
+# ---------------------------------------------------------------------------
+# Sampling profiles
+#
+# Two named speeds, switchable at RUNTIME from the admin UI (the choice lives in
+# app_settings.sampling_profile, like the other switches) rather than at deploy
+# time. Everything above is the "relaxed" profile and stays env-overridable
+# exactly as before; "fast" restores the original aggressive cadence for when a
+# video is worth watching closely.
+#
+# Fast is ~10x the discovery requests and ~16x the sampling requests of relaxed
+# (6x as many sweeps, 2.7x the samples in each). It is no longer a memory
+# question -- peak memory is bounded by SAMPLE_CONCURRENCY either way -- so the
+# cost is request volume and a modestly higher (still small) resident set.
+# ---------------------------------------------------------------------------
+def _fast(name: str, default: int) -> int:
+    """A fast-profile knob, overridable as FAST_MODE_<name>."""
+    return int(os.environ.get(f"FAST_MODE_{name}", str(default)))
+
+
+SAMPLING_PROFILES = {
+    "relaxed": {
+        "new_video_check_interval": NEW_VIDEO_CHECK_INTERVAL,
+        "active_video_check_interval": ACTIVE_VIDEO_CHECK_INTERVAL,
+        "samples_per_run": SAMPLES_PER_RUN,
+        "fast_samples": FAST_SAMPLES,
+        "sample_concurrency": SAMPLE_CONCURRENCY,
+    },
+    # The original settings, before the cost work: poll every 3 minutes,
+    # re-sample hourly, 40 samples a sweep and a 90-sample opening burst.
+    "fast": {
+        "new_video_check_interval": _fast("NEW_VIDEO_CHECK_INTERVAL", 180),
+        "active_video_check_interval": _fast("ACTIVE_VIDEO_CHECK_INTERVAL", 3600),
+        "samples_per_run": _fast("SAMPLES_PER_RUN", 40),
+        "fast_samples": _fast("FAST_SAMPLES", 90),
+        "sample_concurrency": _fast("SAMPLE_CONCURRENCY", 8),
+    },
+}
+
+DEFAULT_SAMPLING_PROFILE = "relaxed"
+
+# The concurrency gate is sized once at import for the widest profile, then
+# narrowed at runtime -- a semaphore cannot grow past its initial value.
+MAX_SAMPLE_CONCURRENCY = max(
+    p["sample_concurrency"] for p in SAMPLING_PROFILES.values()
+)
+
+
+def profile_settings(name: str) -> dict:
+    """Effective sampling settings for a profile name (unknown -> the default)."""
+    return SAMPLING_PROFILES.get(name, SAMPLING_PROFILES[DEFAULT_SAMPLING_PROFILE])

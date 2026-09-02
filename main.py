@@ -24,23 +24,20 @@ from datetime import date, datetime
 from typing import List
 
 from config import (
-    ACTIVE_VIDEO_CHECK_INTERVAL,
     CHANNELS,
     COMMENT_INTROS,
     COMMENT_REFRESH_HOURS,
     CUTOFF_DATE,
-    FAST_SAMPLES,
     INACTIVE_DAYS_THRESHOLD,
     MAX_TRACK_DAYS,
     META_REFRESH_INTERVAL,
-    NEW_VIDEO_CHECK_INTERVAL,
     RATIO_WINDOW_DAYS,
-    SAMPLE_CONCURRENCY,
-    SAMPLES_PER_RUN,
     SCHEDULER_WORKERS,
     SKIP_COMMENT,
+    profile_settings,
 )
 from scraper import get_videos_from_rss, is_short, sample_titles
+import youtube_innertube
 from storage import (
     COMMENTING_ENABLED_KEY,
     add_title_sample,
@@ -61,6 +58,7 @@ from storage import (
     mark_video_ignored,
     mark_video_inactive,
     operations_enabled,
+    sampling_profile,
     seed_channel_if_missing,
     seed_setting_if_missing,
     set_comment_id,
@@ -75,6 +73,15 @@ from youtube_comment import fetch_comment_meta, post_comment, update_comment
 # I/O-bound work, so this can comfortably exceed CPU core count -- sized via
 # SCHEDULER_WORKERS to give headroom as more channels are tracked.
 executor = ThreadPoolExecutor(max_workers=SCHEDULER_WORKERS)
+
+def _sampling() -> dict:
+    """The sampling settings for the profile that is active right now.
+
+    Read per use rather than captured at import, so flipping the profile in the
+    admin UI changes the next sweep instead of needing a redeploy.
+    """
+    return profile_settings(sampling_profile())
+
 
 def _past_tracking_age(published_at) -> bool:
     """Whether a video is older than MAX_TRACK_DAYS (0 disables the cap).
@@ -338,9 +345,10 @@ def process_video(video_id: str, channel_id: str, channel_name: str, published_a
     # FAST PATH: brand-new video -> sample a quick burst, then deepen. We only
     # actually post once >= 2 variants are seen (see _ensure_comment), so a video
     # that isn't being A/B tested never gets a misleading "testing titles" comment.
+    cfg = _sampling()
     if fast_first and new_video and _commenting_allowed():
         try:
-            quick = sample_titles(video_id, FAST_SAMPLES, parallel=True)
+            quick = sample_titles(video_id, cfg["fast_samples"], parallel=True)
         except Exception as e:
             print(f"[{channel_name}] ERROR sampling {video_id}: {e}", flush=True)
             quick = []
@@ -350,7 +358,7 @@ def process_video(video_id: str, channel_id: str, channel_name: str, published_a
             _ensure_comment(video_id, channel_name)
 
         # Deepen sampling, then post/update if a new variant turned up.
-        remaining = max(0, SAMPLES_PER_RUN - FAST_SAMPLES)
+        remaining = max(0, cfg["samples_per_run"] - cfg["fast_samples"])
         if remaining:
             before = _distinct_titles(video_id)
             _record_samples(video_id, sample_titles(video_id, remaining))
@@ -363,7 +371,7 @@ def process_video(video_id: str, channel_id: str, channel_name: str, published_a
 
     # FULL PATH: existing comment, or commenting disabled.
     before = None if new_video else _distinct_titles(video_id)
-    titles = sample_titles(video_id, SAMPLES_PER_RUN)
+    titles = sample_titles(video_id, cfg["samples_per_run"])
     if not titles:
         print(f"[{channel_name}] No titles found for {video_id}", flush=True)
         return
@@ -511,7 +519,7 @@ def _check_one_active_video(video_info: dict, refresh_meta: bool = True) -> None
     """Body of the hourly per-video check, run concurrently across all active
     videos (see check_active_videos) rather than one at a time -- with a few
     hundred active videos across many channels, a sequential loop here could
-    run longer than ACTIVE_VIDEO_CHECK_INTERVAL and delay new-video checks,
+    run longer than the re-sampling interval and delay new-video checks,
     since both run on the same scheduler thread.
 
     refresh_meta: whether to also poll the comment's engagement metrics this
@@ -551,7 +559,7 @@ def _check_one_active_video(video_info: dict, refresh_meta: bool = True) -> None
         # (posting/editing on a new variant) is NEVER throttled -- it runs every
         # hour and is the timely part.
         before = _distinct_titles(video_id)
-        titles = sample_titles(video_id, SAMPLES_PER_RUN, parallel=True)
+        titles = sample_titles(video_id, _sampling()["samples_per_run"], parallel=True)
         if not titles:
             return
         _record_samples(video_id, titles)
@@ -638,14 +646,19 @@ def run_scheduler():
 
     enabled_count = len(get_enabled_channels())
     running = operations_enabled(fresh=True)
+    profile = sampling_profile()
+    cfg = profile_settings(profile)
+    youtube_innertube.set_sample_concurrency(cfg["sample_concurrency"])
     print(f"Starting scheduler:")
     print(f"  - Tracking (master switch): {'ON' if running else 'OFF (paused)'}")
     print(f"  - Commenting: {'ON' if _commenting_allowed() else 'OFF'}"
           f"{' (forced off by SKIP_COMMENT)' if SKIP_COMMENT else ''}")
-    print(f"  - New video check: every {NEW_VIDEO_CHECK_INTERVAL}s")
-    print(f"  - Active video check: every {ACTIVE_VIDEO_CHECK_INTERVAL}s")
-    print(f"  - Samples per run: {SAMPLES_PER_RUN} (first burst {FAST_SAMPLES}, "
-          f"max {SAMPLE_CONCURRENCY} concurrent)")
+    print(f"  - Sampling profile: {profile}")
+    print(f"  - New video check: every {cfg['new_video_check_interval']}s")
+    print(f"  - Active video check: every {cfg['active_video_check_interval']}s")
+    print(f"  - Samples per run: {cfg['samples_per_run']} "
+          f"(first burst {cfg['fast_samples']}, "
+          f"max {cfg['sample_concurrency']} concurrent)")
     print(f"  - Channels enabled: {enabled_count}")
     print(f"  - Fallback cutoff date (legacy channels only): {CUTOFF_DATE}")
     print(f"  - Inactive threshold: {INACTIVE_DAYS_THRESHOLD} days")
@@ -656,6 +669,7 @@ def run_scheduler():
     last_active_check = time.time()  # Don't run the sampling sweep immediately on startup
     last_meta_check = 0  # Refresh engagement metrics on the first active sweep
     was_running = running
+    was_profile = profile
 
     try:
         while True:
@@ -689,8 +703,22 @@ def run_scheduler():
                 time.sleep(10)
                 continue
 
+            # Sampling profile, same deal: re-read every tick so a switch in the
+            # admin UI applies to the next sweep, not the next deploy.
+            profile = sampling_profile()
+            cfg = profile_settings(profile)
+            if profile != was_profile:
+                youtube_innertube.set_sample_concurrency(cfg["sample_concurrency"])
+                print(f"\n*** Sampling profile -> {profile}: check every "
+                      f"{cfg['new_video_check_interval']}s, re-sample every "
+                      f"{cfg['active_video_check_interval']}s, "
+                      f"{cfg['samples_per_run']} samples/sweep ***", flush=True)
+                if cfg["sample_concurrency"] < profile_settings(was_profile)["sample_concurrency"]:
+                    _release_memory()  # stepping down -> give the headroom back
+                was_profile = profile
+
             # Check for new videos
-            if now - last_new_check >= NEW_VIDEO_CHECK_INTERVAL:
+            if now - last_new_check >= cfg["new_video_check_interval"]:
                 check_new_videos()
                 last_new_check = now
 
@@ -698,7 +726,7 @@ def run_scheduler():
             # ACTIVE_VIDEO_CHECK_INTERVAL, but the (1 Data API unit each)
             # engagement-metric poll only piggybacks on this sweep every
             # META_REFRESH_INTERVAL -- keeping the daily quota in check at scale.
-            if now - last_active_check >= ACTIVE_VIDEO_CHECK_INTERVAL:
+            if now - last_active_check >= cfg["active_video_check_interval"]:
                 refresh_meta = now - last_meta_check >= META_REFRESH_INTERVAL
                 check_active_videos(refresh_meta=refresh_meta)
                 last_active_check = now
