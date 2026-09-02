@@ -30,10 +30,14 @@ from storage import (
     add_channel_admin,
     get_all_videos_summary,
     get_channels_with_metrics,
+    get_setting,
     get_title_daily_counts,
     get_video_info,
     init_db,
+    operations_enabled,
     set_channel_enabled,
+    set_operations_enabled,
+    set_setting,
 )
 
 app = Flask(__name__)
@@ -316,6 +320,49 @@ def update_channel(channel_id: str):
         return _server_error(e)
 
 
+@app.route("/api/admin/operations", methods=["GET"])
+@require_admin
+def get_operations():
+    """Current state of the master tracking switch."""
+    try:
+        return jsonify({
+            "enabled": operations_enabled(fresh=True),
+            "changed_at": get_setting("operations_enabled_changed_at"),
+        })
+    except Exception as e:
+        return _server_error(e)
+
+
+@app.route("/api/admin/operations", methods=["POST"])
+@require_admin
+def set_operations():
+    """Master switch: start or stop ALL outbound tracking work.
+
+    Off means the scheduler stops polling channels, stops sampling titles and
+    stops posting or editing comments -- while this web process keeps serving
+    the dashboard, so the site and its history stay online.
+
+    This is a separate axis from the per-channel toggles and never touches them:
+    the channel selection is preserved exactly as-is across a pause. Turning
+    tracking back on moves every channel's cutoff to today (see
+    storage.bump_all_track_from_dates, applied by the scheduler), so the pause
+    window is not backfilled.
+    """
+    body = request.get_json(silent=True) or {}
+    if "enabled" not in body:
+        return jsonify({"error": "enabled is required"}), 400
+    enabled = bool(body["enabled"])
+
+    try:
+        set_operations_enabled(enabled)
+        set_setting("operations_enabled_changed_at", datetime.now().isoformat(timespec="seconds"))
+        logger.warning("Tracking %s by admin from %s",
+                       "ENABLED" if enabled else "PAUSED", _client_ip())
+        return jsonify({"status": "ok", "enabled": enabled})
+    except Exception as e:
+        return _server_error(e)
+
+
 @app.route("/api/health", methods=["GET"])
 def health():
     """Health check endpoint."""
@@ -378,6 +425,10 @@ def get_stats():
             "inactive_videos": len(inactive),
             "total_in_db": len(all_videos),
             "ratio_window_days": RATIO_WINDOW_DAYS,
+            # Whether new data is still being collected. Public on purpose: it
+            # exposes nothing sensitive and it is the honest caption for a
+            # dashboard that has stopped updating.
+            "tracking_enabled": operations_enabled(),
         })
     except Exception as e:
         return _server_error(e)

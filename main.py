@@ -1,7 +1,21 @@
 """
-Main scheduler: checks for new videos every 3 minutes, checks active videos every hour.
-Processes videos immediately and tracks title history.
+Main scheduler: polls channels for new videos, re-samples active videos on a
+slower cadence, and keeps their comments up to date.
+
+Master switch
+-------------
+Everything in here is gated on storage.operations_enabled() -- the runtime
+"tracking on/off" switch flipped from the admin UI. When it is OFF the scheduler
+does no outbound work at all: no RSS polls, no title sampling, no comment posts
+or edits, no YouTube Data API calls. The Flask app keeps serving the dashboard,
+so the site and its history stay online while the tracker itself costs nothing
+beyond an idle container.
+
+The switch is deliberately INDEPENDENT of the per-channel enabled flags: pausing
+never reads or writes them, so the channel selection survives a pause untouched.
 """
+import ctypes
+import gc
 import hashlib
 import sys
 import time
@@ -17,9 +31,11 @@ from config import (
     CUTOFF_DATE,
     FAST_SAMPLES,
     INACTIVE_DAYS_THRESHOLD,
+    MAX_TRACK_DAYS,
     META_REFRESH_INTERVAL,
     NEW_VIDEO_CHECK_INTERVAL,
     RATIO_WINDOW_DAYS,
+    SAMPLE_CONCURRENCY,
     SAMPLES_PER_RUN,
     SCHEDULER_WORKERS,
     SKIP_COMMENT,
@@ -28,6 +44,7 @@ from scraper import get_videos_from_rss, is_short, sample_titles
 from storage import (
     add_title_sample,
     add_video,
+    bump_all_track_from_dates,
     get_active_videos,
     get_comment_id,
     get_comment_state,
@@ -41,6 +58,7 @@ from storage import (
     is_video_active,
     mark_video_ignored,
     mark_video_inactive,
+    operations_enabled,
     seed_channel_if_missing,
     set_comment_id,
     update_comment_edited,
@@ -55,6 +73,22 @@ from youtube_comment import fetch_comment_meta, post_comment, update_comment
 # SCHEDULER_WORKERS to give headroom as more channels are tracked.
 executor = ThreadPoolExecutor(max_workers=SCHEDULER_WORKERS)
 
+def _release_memory() -> None:
+    """Hand freed heap back to the OS after a sweep.
+
+    Sampling allocates and frees large JSON documents. CPython returns those to
+    its allocator, and glibc keeps them in per-thread arenas, so the process's
+    resident set stays at its high-water mark forever even while idle -- and
+    resident memory is what the host bills for, around the clock. malloc_trim
+    releases the free arenas; it is a no-op on non-glibc platforms.
+    """
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass  # not glibc (macOS/musl) -- nothing to do
+
+
 # NOTE on pause/resume with no backfill: there is deliberately no "anchor
 # resync" step. A channel's per-channel track_from_date cutoff is bumped to
 # today whenever it's added or (re)enabled (see storage.set_channel_enabled /
@@ -67,6 +101,9 @@ executor = ThreadPoolExecutor(max_workers=SCHEDULER_WORKERS)
 
 def reprocess_videos_without_comments():
     """Find and reprocess any active videos that don't have comments yet."""
+    if not operations_enabled():
+        print("Tracking is paused - skipping reprocess of videos without comments")
+        return
     videos = get_videos_without_comments()
     if not videos:
         print("No videos without comments to reprocess")
@@ -176,7 +213,7 @@ def _maybe_update_comment(video_id: str, channel_name: str, before_titles) -> No
     per COMMENT_REFRESH_HOURS so we don't re-edit every hour (quota / "edited"
     spam). Identical text never triggers an edit.
     """
-    if SKIP_COMMENT:
+    if SKIP_COMMENT or not operations_enabled():
         return
     state = get_comment_state(video_id, COMMENT_REFRESH_HOURS)
     if not state or not state["comment_id"]:
@@ -205,7 +242,7 @@ def _ensure_comment(video_id: str, channel_name: str, before_titles=None) -> Non
     (and most "first 15 samples" only ever see the dominant title). Existing
     comments are refreshed when a new variant turns up.
     """
-    if SKIP_COMMENT:
+    if SKIP_COMMENT or not operations_enabled():
         return
     if get_comment_id(video_id):
         _maybe_update_comment(video_id, channel_name, before_titles)
@@ -239,6 +276,11 @@ def process_video(video_id: str, channel_id: str, channel_name: str, published_a
                 parallel burst, then keep sampling and update the comment only if
                 new variants turn up.
     """
+    # Tasks are queued on a shared executor and can start after the master
+    # switch was flipped off, so re-check here rather than only at submit time.
+    if not operations_enabled():
+        return
+
     print(f"[{channel_name}] Processing {video_id} (published {published_at.date()})", flush=True)
 
     new_video = not get_comment_id(video_id)
@@ -291,6 +333,9 @@ def check_new_videos():
     new videos IN PARALLEL. When new video found, spawn background task to
     process it immediately.
     """
+    if not operations_enabled():
+        return
+
     print(f"\n=== Checking for new videos at {datetime.now()} ===")
 
     def check_channel(channel_slug: str, channel_name: str, track_from_date) -> List[tuple]:
@@ -422,10 +467,31 @@ def _check_one_active_video(video_info: dict, refresh_meta: bool = True) -> None
     refresh_meta: whether to also poll the comment's engagement metrics this
     pass (1 Data API unit each). Sampling + comment posting/editing always run;
     only this metrics poll is gated to a slower cadence."""
+    if not operations_enabled():
+        return
+
     video_id = video_info["video_id"]
     channel_name = video_info.get("channel_name") or video_info["channel_id"]
 
     try:
+        # Aged out -> stop tracking, whatever the title is still doing. The
+        # stagnation rule below only retires videos that settled on ONE title,
+        # so a video whose experiment keeps flip-flopping stayed in the active
+        # set indefinitely and the sweep grew without bound. Title experiments
+        # are decided within days of upload; MAX_TRACK_DAYS = 0 disables this.
+        published_at = video_info.get("published_at")
+        if MAX_TRACK_DAYS > 0 and published_at is not None:
+            # Stored as a naive TIMESTAMP, but RSS parsing has produced aware
+            # datetimes before -- compare on the same footing either way.
+            if published_at.tzinfo is not None:
+                published_at = published_at.replace(tzinfo=None)
+            age_days = (datetime.now() - published_at).days
+            if age_days >= MAX_TRACK_DAYS:
+                print(f"[{channel_name}] {video_id} is {age_days}d old "
+                      f"(cap {MAX_TRACK_DAYS}d) - marking inactive")
+                mark_video_inactive(video_id)
+                return
+
         # Stagnated (same single title for N days straight) -> stop tracking.
         # The comment already reflects the latest titles from prior checks, so
         # there's nothing new to post here.
@@ -480,6 +546,9 @@ def check_active_videos(refresh_meta: bool = True):
     comments as usual but skips the engagement-metric API poll (see the scheduler
     loop, which only enables it every META_REFRESH_INTERVAL).
     """
+    if not operations_enabled():
+        return
+
     print(f"\n=== Checking active videos at {datetime.now()} (refresh_meta={refresh_meta}) ===")
 
     active_videos = get_active_videos()
@@ -487,11 +556,25 @@ def check_active_videos(refresh_meta: bool = True):
 
     futures = [executor.submit(_check_one_active_video, v, refresh_meta) for v in active_videos]
     for future in as_completed(futures):
-        future.result()  # exceptions are already caught/logged inside; re-raise only bugs in the wrapper itself
+        try:
+            future.result()  # errors are caught/logged inside; this catches bugs in the wrapper
+        except Exception as e:
+            # Must never escape: this runs on the scheduler thread, and an
+            # exception here would kill the loop and silently stop all tracking
+            # while the web process carried on serving.
+            print(f"Active-video check crashed: {e}", file=sys.stderr)
+
+    # The sweep just allocated and freed a lot of large documents; give the
+    # memory back rather than sitting on the high-water mark until restart.
+    _release_memory()
 
 
 def run_scheduler():
-    """Run the main scheduler loop."""
+    """Run the main scheduler loop.
+
+    Honours the master switch: while tracking is paused the loop does nothing
+    but tick, so the process idles and the dashboard stays up.
+    """
     print("Initializing database...")
     init_db()
 
@@ -506,21 +589,55 @@ def run_scheduler():
     reprocess_videos_without_comments()
 
     enabled_count = len(get_enabled_channels())
+    running = operations_enabled(fresh=True)
     print(f"Starting scheduler:")
+    print(f"  - Tracking (master switch): {'ON' if running else 'OFF (paused)'}")
     print(f"  - New video check: every {NEW_VIDEO_CHECK_INTERVAL}s")
     print(f"  - Active video check: every {ACTIVE_VIDEO_CHECK_INTERVAL}s")
+    print(f"  - Samples per run: {SAMPLES_PER_RUN} (first burst {FAST_SAMPLES}, "
+          f"max {SAMPLE_CONCURRENCY} concurrent)")
     print(f"  - Channels enabled: {enabled_count}")
     print(f"  - Fallback cutoff date (legacy channels only): {CUTOFF_DATE}")
     print(f"  - Inactive threshold: {INACTIVE_DAYS_THRESHOLD} days")
+    print(f"  - Max tracking age: {MAX_TRACK_DAYS or 'unlimited'} days")
     print(f"  - Scheduler workers: {SCHEDULER_WORKERS}")
-    
+
     last_new_check = 0
-    last_active_check = time.time()  # Don't run hourly check immediately on startup
+    last_active_check = time.time()  # Don't run the sampling sweep immediately on startup
     last_meta_check = 0  # Refresh engagement metrics on the first active sweep
+    was_running = running
 
     try:
         while True:
             now = time.time()
+
+            # Master switch. Checked first and on every tick so a pause from the
+            # admin UI takes effect within seconds, without a redeploy.
+            running = operations_enabled()
+            if running != was_running:
+                if running:
+                    # Resuming: move every channel's cutoff to today so the
+                    # backlog that piled up during the pause is skipped by the
+                    # date gate. Without this, resuming after weeks off would
+                    # process every upload since the pause in one burst and
+                    # comment on videos whose title tests ended long ago. This
+                    # touches track_from_date ONLY -- the per-channel enabled
+                    # flags are never read or written by the master switch.
+                    bumped = bump_all_track_from_dates()
+                    print(f"\n*** Tracking RESUMED - cutoff moved to today for "
+                          f"{bumped} channels (no backfill) ***", flush=True)
+                    # Don't fire both sweeps the instant we resume.
+                    last_new_check = now
+                    last_active_check = now
+                else:
+                    print("\n*** Tracking PAUSED - no polling, sampling or "
+                          "comments until re-enabled ***", flush=True)
+                    _release_memory()
+                was_running = running
+
+            if not running:
+                time.sleep(10)
+                continue
 
             # Check for new videos
             if now - last_new_check >= NEW_VIDEO_CHECK_INTERVAL:

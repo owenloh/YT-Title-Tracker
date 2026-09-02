@@ -2,5 +2,6 @@
 [phases.setup]
 nixPkgs = ["python311Full"]
 
+# See Procfile for why MALLOC_ARENA_MAX / PYTHONUNBUFFERED are set here.
 [start]
-cmd = "python app.py"
+cmd = "MALLOC_ARENA_MAX=2 PYTHONUNBUFFERED=1 python app.py"

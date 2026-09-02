@@ -229,5 +229,98 @@ class TestChannelIdDetection(unittest.TestCase):
         self.assertFalse(self.fn("UCtooShort"))
 
 
+class TestMasterSwitch(unittest.TestCase):
+    """The master switch's value parsing and the guards that read it.
+
+    storage.get_setting is stubbed, so no database is involved.
+    """
+
+    def setUp(self):
+        import storage
+        self.storage = storage
+        self._orig_get = storage.get_setting
+        storage._settings_cache.clear()
+
+    def tearDown(self):
+        self.storage.get_setting = self._orig_get
+        self.storage._settings_cache.clear()
+
+    def _set(self, raw):
+        self.storage.get_setting = lambda key, default=None: raw if raw is not None else default
+        self.storage._settings_cache.clear()
+
+    def test_defaults_to_on_when_never_set(self):
+        # An existing deployment that has never seen the switch keeps running.
+        self._set(None)
+        self.assertTrue(self.storage.operations_enabled(fresh=True))
+
+    def test_off_values(self):
+        for raw in ("0", "false", "FALSE", "no", "off", " off "):
+            self._set(raw)
+            self.assertFalse(self.storage.operations_enabled(fresh=True), raw)
+
+    def test_on_values(self):
+        for raw in ("1", "true", "yes", "on"):
+            self._set(raw)
+            self.assertTrue(self.storage.operations_enabled(fresh=True), raw)
+
+    def test_cached_read_survives_db_failure(self):
+        """A DB blip must not silently flip the operating mode."""
+        self._set("0")
+        self.assertFalse(self.storage.operations_enabled())  # populates the cache
+
+        def boom(key, default=None):
+            raise RuntimeError("db down")
+
+        self.storage.get_setting = boom
+        self.storage._settings_cache[self.storage.OPERATIONS_ENABLED_KEY] = (
+            0, "0")  # stale timestamp -> forces a re-read, which now fails
+        self.assertFalse(self.storage.operations_enabled())
+
+    def test_sweeps_do_nothing_while_paused(self):
+        import main
+        self._set("0")
+        called = []
+        orig_active, orig_channels = main.get_active_videos, main.get_enabled_channels
+        main.get_active_videos = lambda: called.append("active") or []
+        main.get_enabled_channels = lambda: called.append("channels") or []
+        try:
+            main.check_active_videos()
+            main.check_new_videos()
+        finally:
+            main.get_active_videos, main.get_enabled_channels = orig_active, orig_channels
+        self.assertEqual(called, [])  # no DB reads, no network, no comments
+
+
+class TestTrackingAgeCap(unittest.TestCase):
+    """MAX_TRACK_DAYS retires videos the stagnation rule would keep forever."""
+
+    def setUp(self):
+        import main
+        self.main = main
+
+    def test_video_past_the_cap_is_retired_without_sampling(self):
+        from datetime import datetime, timedelta
+        m = self.main
+        retired, sampled = [], []
+        orig = (m.operations_enabled, m.mark_video_inactive, m.sample_titles, m.MAX_TRACK_DAYS)
+        m.operations_enabled = lambda *a, **k: True
+        m.mark_video_inactive = retired.append
+        m.sample_titles = lambda *a, **k: sampled.append(a) or []
+        m.MAX_TRACK_DAYS = 7
+        try:
+            m._check_one_active_video({
+                "video_id": "old1",
+                "channel_id": "@c",
+                "channel_name": "C",
+                "published_at": datetime.now() - timedelta(days=9),
+            }, refresh_meta=False)
+        finally:
+            (m.operations_enabled, m.mark_video_inactive,
+             m.sample_titles, m.MAX_TRACK_DAYS) = orig
+        self.assertEqual(retired, ["old1"])
+        self.assertEqual(sampled, [])  # retired before any sampling cost is paid
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

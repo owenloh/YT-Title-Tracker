@@ -175,6 +175,13 @@
   footer{text-align:center;color:var(--faint);font-family:var(--mono);font-size:11px;margin-top:26px;letter-spacing:.03em}
 
   @media(prefers-reduced-motion:reduce){.dot,.mark i{animation:none!important}}
+
+  /* Shown when the master tracking switch is off, so a frozen dashboard says so
+     instead of looking broken or silently stale. */
+  .paused-note{border:1px solid rgba(224,103,95,.4);background:rgba(224,103,95,.07);
+    color:var(--ink-2);border-radius:11px;padding:12px 15px;margin-bottom:16px;
+    font-family:var(--mono);font-size:12px;line-height:1.6;letter-spacing:.01em}
+  .paused-note strong{color:var(--red);font-weight:600}
 </style>
 </head>
 <body>
@@ -192,6 +199,11 @@
       <div class="live"><span class="dot"></span><span id="updated">LIVE</span></div>
     </div>
   </header>
+
+  <div class="paused-note" id="pausedNote" hidden>
+    <strong>Tracking is paused.</strong>
+    Everything below is the history collected so far — no new samples are being taken.
+  </div>
 
   <div class="readout" id="stats"></div>
 
@@ -234,7 +246,7 @@ const VC = ['var(--v0)','var(--v1)','var(--v2)','var(--v3)','var(--v4)','var(--v
 const A = window.anime;                       // vendored anime.js (null-safe below)
 const REDUCE = window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches;
 const MOTION = !!A && !REDUCE;                 // master switch for animation
-let all = [], filter = 'active-tests', windowDays = 3;
+let all = [], filter = 'active-tests', windowDays = 3, trackingOn = true;
 let firstPaint = true;
 const expanded = new Set();      // video_ids with the history timeline open
 const timelineCache = {};        // video_id -> timeline rows
@@ -253,6 +265,9 @@ async function load(){
     all = vids.videos || [];
     windowDays = stats.ratio_window_days || 3;
     document.getElementById('splitlbl').textContent = `· split over last ${windowDays}d`;
+    // tracking_enabled is absent on older API versions -> treat as running.
+    trackingOn = stats.tracking_enabled !== false;
+    document.getElementById('pausedNote').hidden = trackingOn;
     renderStats(stats);
     render(firstPaint);
     firstPaint = false;
@@ -478,7 +493,14 @@ function engage(v, kind){
 function fmt(d){ if(!d) return '<span class="dash">—</span>';
   return new Date(d).toLocaleDateString(undefined,{month:'short',day:'numeric'}); }
 function fmtNum(n){ return (n||0).toLocaleString(); }
-function stamp(){ document.getElementById('updated').textContent = new Date().toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit'}); }
+function stamp(){
+  // The pill reflects whether data is still being COLLECTED, not whether the
+  // page just refreshed -- a paused tracker showing a fresh timestamp reads as
+  // live data when it isn't.
+  document.getElementById('updated').textContent = trackingOn
+    ? new Date().toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit'})
+    : 'PAUSED';
+}
 function esc(s){ return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function trunc(s,n){ return s.length>n ? s.slice(0,n-1)+'…' : s; }
 

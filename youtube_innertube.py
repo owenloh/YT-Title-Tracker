@@ -39,12 +39,15 @@ import html as _html
 import json
 import random
 import re as _re
+import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Set
 
 import requests
+
+from config import SAMPLE_CONCURRENCY
 
 _INNERTUBE_URL = "https://www.youtube.com/youtubei/v1/{endpoint}?prettyPrint=false"
 # Public InnerTube key used by the YouTube web client. Not a secret -- it ships
@@ -163,6 +166,26 @@ def _headers(client_key: str) -> dict:
     }
 
 
+# Process-wide ceiling on concurrent InnerTube requests.
+#
+# Memory, not CPU or rate limiting, is why this exists. A /next response is a
+# multi-megabyte JSON document that expands several-fold once parsed into Python
+# objects; the resident set of the process is set by how many of those exist at
+# the same instant, and CPython does not hand that memory back to the OS
+# afterwards. Sampling used to create a fresh ThreadPoolExecutor(8) per video
+# with no global bound, so a sweep over N videos ran 8N parses concurrently and
+# pinned the deployment's high-water mark at gigabytes. One shared semaphore
+# caps it regardless of how many videos are being sampled at once.
+_sample_gate = threading.Semaphore(max(1, SAMPLE_CONCURRENCY))
+
+# One shared connection pool for every sampling thread. Without it each request
+# opened (and TLS-handshook) its own connection.
+_session = requests.Session()
+_session.mount("https://", requests.adapters.HTTPAdapter(
+    pool_connections=4, pool_maxsize=max(4, SAMPLE_CONCURRENCY * 2), max_retries=0,
+))
+
+
 def _post(endpoint: str, video_id: str, client_key: str,
           timeout: float = 15.0) -> Optional[dict]:
     """One InnerTube POST. Returns parsed JSON or None on any failure.
@@ -174,11 +197,15 @@ def _post(endpoint: str, video_id: str, client_key: str,
     url = _INNERTUBE_URL.format(endpoint=endpoint) + f"&key={_INNERTUBE_KEY}"
     payload = {"context": _context(client_key), "videoId": video_id}
     try:
-        r = requests.post(url, headers=_headers(client_key),
-                          data=json.dumps(payload), timeout=timeout)
-        if r.status_code != 200:
-            return None
-        return r.json()
+        # The gate is held across the request AND the parse -- the parsed
+        # document is the expensive part, so releasing before json() would let
+        # unbounded numbers of them pile up.
+        with _sample_gate:
+            r = _session.post(url, headers=_headers(client_key),
+                              data=json.dumps(payload), timeout=timeout)
+            if r.status_code != 200:
+                return None
+            return r.json()
     except Exception:
         return None
 
@@ -195,12 +222,17 @@ def _sample_once(video_id: str, client_key: str) -> Set[str]:
     nxt = _post("next", video_id, client_key)
     if nxt:
         titles |= extract_titles_from_next(nxt)
+    # Drop the multi-megabyte document immediately; only the handful of extracted
+    # strings is worth keeping, and holding it until the function returns is what
+    # multiplies across concurrent samples.
+    del nxt
 
     # /player is a reliable backstop and a second experiment surface.
     if not titles:
         ply = _post("player", video_id, client_key)
         if ply:
             titles |= extract_titles_from_player(ply)
+        del ply
 
     return titles
 
@@ -231,7 +263,11 @@ def sample_variant_titles(video_id: str, samples: int = 40, delay: float = 0.8,
 
     if parallel:
         observed: List[str] = []
-        with ThreadPoolExecutor(max_workers=min(samples, 8)) as ex:
+        # Worker count is capped by the same global ceiling as the requests
+        # themselves: extra threads beyond it would only queue on _sample_gate
+        # while each holding a stack.
+        workers = max(1, min(samples, SAMPLE_CONCURRENCY))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
             futures = [
                 ex.submit(_sample_once, video_id, _CLIENT_KEYS[i % len(_CLIENT_KEYS)])
                 for i in range(samples)
