@@ -182,6 +182,9 @@
     color:var(--ink-2);border-radius:11px;padding:12px 15px;margin-bottom:16px;
     font-family:var(--mono);font-size:12px;line-height:1.6;letter-spacing:.01em}
   .paused-note strong{color:var(--red);font-weight:600}
+  /* Commenting-off is a deliberate setting, not a fault -- amber, not red. */
+  .paused-note.info{border-color:rgba(224,166,60,.4);background:rgba(224,166,60,.07)}
+  .paused-note.info strong{color:var(--amber)}
 </style>
 </head>
 <body>
@@ -200,10 +203,7 @@
     </div>
   </header>
 
-  <div class="paused-note" id="pausedNote" hidden>
-    <strong>Tracking is paused.</strong>
-    Everything below is the history collected so far — no new samples are being taken.
-  </div>
+  <div class="paused-note" id="pausedNote" hidden></div>
 
   <div class="readout" id="stats"></div>
 
@@ -246,7 +246,7 @@ const VC = ['var(--v0)','var(--v1)','var(--v2)','var(--v3)','var(--v4)','var(--v
 const A = window.anime;                       // vendored anime.js (null-safe below)
 const REDUCE = window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches;
 const MOTION = !!A && !REDUCE;                 // master switch for animation
-let all = [], filter = 'active-tests', windowDays = 3, trackingOn = true;
+let all = [], filter = 'active-tests', windowDays = 3, trackingOn = true, commentingOn = true;
 let firstPaint = true;
 const expanded = new Set();      // video_ids with the history timeline open
 const timelineCache = {};        // video_id -> timeline rows
@@ -267,7 +267,8 @@ async function load(){
     document.getElementById('splitlbl').textContent = `· split over last ${windowDays}d`;
     // tracking_enabled is absent on older API versions -> treat as running.
     trackingOn = stats.tracking_enabled !== false;
-    document.getElementById('pausedNote').hidden = trackingOn;
+    commentingOn = stats.commenting_enabled !== false;
+    renderNotice();
     renderStats(stats);
     render(firstPaint);
     firstPaint = false;
@@ -306,10 +307,33 @@ function renderStats(s){
   el.querySelectorAll('.nv').forEach((nv,i)=> countUp(nv, cards[i].v));
 }
 
+function renderNotice(){
+  const el = document.getElementById('pausedNote');
+  el.classList.remove('info');
+  if(!trackingOn){
+    el.innerHTML = '<strong>Tracking is paused.</strong> Everything below is the history '
+      + 'collected so far — no new samples are being taken.';
+    el.hidden = false;
+  } else if(!commentingOn){
+    el.classList.add('info');
+    el.innerHTML = '<strong>Commenting is off.</strong> Titles are still being sampled and '
+      + 'the numbers below stay current — nothing is being posted to YouTube.';
+    el.hidden = false;
+  } else {
+    el.hidden = true;
+  }
+}
+
 function statusBadge(v){
   if(!v.comment_id){
-    const pending = (v.unique_titles||0) >= 2;
-    return `<span class="badge b-slate"><span class="bd"></span>${pending?'Posting…':'—'}</span>`;
+    // "Posting…" is a promise, so only make it when something is actually going
+    // to post. With commenting switched off, a video with 2+ variants is a
+    // detection that will never be commented, not one in a queue.
+    if((v.unique_titles||0) < 2) return `<span class="badge b-slate"><span class="bd"></span>—</span>`;
+    const [cls,label] = commentingOn ? ['b-slate','Posting…'] : ['b-slate','Not posted'];
+    return `<span class="badge ${cls}" title="${commentingOn
+      ? 'Queued — a comment is posted once the variants are confirmed'
+      : 'Commenting is switched off; titles are still being tracked'}"><span class="bd"></span>${label}</span>`;
   }
   const map = {
     published:['b-green','Live'], unknown:['b-green','Live'],

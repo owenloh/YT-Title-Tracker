@@ -28,6 +28,7 @@ from config import SAMPLING_PROFILES, SKIP_COMMENT, parse_channels_str, profile_
 from scraper import resolve_channel_id
 from storage import (
     add_channel_admin,
+    commenting_active,
     commenting_enabled,
     get_all_videos_summary,
     get_channels_with_metrics,
@@ -472,6 +473,10 @@ def get_stats():
             # exposes nothing sensitive and it is the honest caption for a
             # dashboard that has stopped updating.
             "tracking_enabled": operations_enabled(),
+            # Whether comments are actually being posted -- the dashboard's
+            # comment column is meaningless without it (a video with 2+ variants
+            # and no comment is "posting soon" or "never", depending on this).
+            "commenting_enabled": commenting_active(),
         })
     except Exception as e:
         return _server_error(e)

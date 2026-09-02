@@ -54,7 +54,7 @@ from storage import (
     get_videos_without_comments,
     init_db,
     is_video_active,
-    commenting_enabled,
+    commenting_active,
     mark_video_ignored,
     mark_video_inactive,
     operations_enabled,
@@ -103,11 +103,12 @@ def _past_tracking_age(published_at) -> bool:
 def _commenting_allowed() -> bool:
     """Whether a comment may be posted or edited right now.
 
-    Three independent gates, narrowest last: SKIP_COMMENT (deploy-level, needs a
-    redeploy), the master switch (stops everything), and the runtime commenting
-    switch (stops writes to YouTube while sampling and the dashboard continue).
+    The rule itself (SKIP_COMMENT, the master switch, the commenting switch)
+    lives in storage so the dashboard reports the same answer the scheduler acts
+    on -- a dashboard saying "Posting..." while nothing is being posted is worse
+    than no status at all.
     """
-    return not SKIP_COMMENT and operations_enabled() and commenting_enabled()
+    return commenting_active()
 
 
 def _release_memory() -> None:

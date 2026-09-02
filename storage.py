@@ -14,6 +14,7 @@ from config import (
     DB_POOL_MAX,
     DEFAULT_SAMPLING_PROFILE,
     RATIO_WINDOW_DAYS,
+    SKIP_COMMENT,
     SAMPLING_PROFILES,
     SCHEDULER_WORKERS,
 )
@@ -308,6 +309,18 @@ def commenting_enabled() -> bool:
 
 def set_commenting_enabled(enabled: bool) -> None:
     set_setting(COMMENTING_ENABLED_KEY, "1" if enabled else "0")
+
+
+def commenting_active() -> bool:
+    """Whether comments are actually being posted right now.
+
+    All three gates, narrowest last: SKIP_COMMENT (deploy-level), the master
+    switch (stops everything), and the commenting switch. Defined once here
+    because the scheduler and the dashboard must agree -- a dashboard that says
+    "Posting..." while the scheduler is posting nothing is worse than no status
+    at all.
+    """
+    return not SKIP_COMMENT and operations_enabled() and commenting_enabled()
 
 
 def sampling_profile() -> str:

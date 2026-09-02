@@ -216,7 +216,8 @@ Public (read-only — these power the dashboard website):
 - `GET /` - Dashboard
 - `GET /api/videos` - All videos with stats
 - `GET /api/video/<id>` - One video + title timeline
-- `GET /api/stats` - Summary counts
+- `GET /api/stats` - Summary counts, plus `tracking_enabled` / `commenting_enabled`
+  so the dashboard can say why it has stopped changing
 - `GET /api/health` - Health check
 
 Admin (requires the `ADMIN_TOKEN` secret):
