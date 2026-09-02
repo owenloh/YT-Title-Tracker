@@ -229,5 +229,240 @@ class TestChannelIdDetection(unittest.TestCase):
         self.assertFalse(self.fn("UCtooShort"))
 
 
+class TestMasterSwitch(unittest.TestCase):
+    """The master switch's value parsing and the guards that read it.
+
+    storage.get_setting is stubbed, so no database is involved.
+    """
+
+    def setUp(self):
+        import storage
+        self.storage = storage
+        self._orig_get = storage.get_setting
+        storage._settings_cache.clear()
+
+    def tearDown(self):
+        self.storage.get_setting = self._orig_get
+        self.storage._settings_cache.clear()
+
+    def _set(self, raw):
+        self.storage.get_setting = lambda key, default=None: raw if raw is not None else default
+        self.storage._settings_cache.clear()
+
+    def test_defaults_to_on_when_never_set(self):
+        # An existing deployment that has never seen the switch keeps running.
+        self._set(None)
+        self.assertTrue(self.storage.operations_enabled(fresh=True))
+
+    def test_off_values(self):
+        for raw in ("0", "false", "FALSE", "no", "off", " off "):
+            self._set(raw)
+            self.assertFalse(self.storage.operations_enabled(fresh=True), raw)
+
+    def test_on_values(self):
+        for raw in ("1", "true", "yes", "on"):
+            self._set(raw)
+            self.assertTrue(self.storage.operations_enabled(fresh=True), raw)
+
+    def test_cached_read_survives_db_failure(self):
+        """A DB blip must not silently flip the operating mode."""
+        self._set("0")
+        self.assertFalse(self.storage.operations_enabled())  # populates the cache
+
+        def boom(key, default=None):
+            raise RuntimeError("db down")
+
+        self.storage.get_setting = boom
+        self.storage._settings_cache[self.storage.OPERATIONS_ENABLED_KEY] = (
+            0, "0")  # stale timestamp -> forces a re-read, which now fails
+        self.assertFalse(self.storage.operations_enabled())
+
+    def test_sweeps_do_nothing_while_paused(self):
+        import main
+        self._set("0")
+        called = []
+        orig_active, orig_channels = main.get_active_videos, main.get_enabled_channels
+        main.get_active_videos = lambda: called.append("active") or []
+        main.get_enabled_channels = lambda: called.append("channels") or []
+        try:
+            main.check_active_videos()
+            main.check_new_videos()
+        finally:
+            main.get_active_videos, main.get_enabled_channels = orig_active, orig_channels
+        self.assertEqual(called, [])  # no DB reads, no network, no comments
+
+
+class TestCommentingGate(unittest.TestCase):
+    """storage.commenting_active: three independent gates, narrowest last.
+
+    The scheduler (main._commenting_allowed) and the dashboard's status column
+    both read this one rule, so it is asserted through both entry points.
+    """
+
+    def setUp(self):
+        import main, storage
+        self.m, self.s = main, storage
+        self._orig = (storage.SKIP_COMMENT, storage.operations_enabled,
+                      storage.commenting_enabled)
+
+    def tearDown(self):
+        (self.s.SKIP_COMMENT, self.s.operations_enabled,
+         self.s.commenting_enabled) = self._orig
+
+    def _gates(self, skip, master, commenting):
+        self.s.SKIP_COMMENT = skip
+        self.s.operations_enabled = lambda *a, **k: master
+        self.s.commenting_enabled = lambda *a, **k: commenting
+
+    def _assert(self, expected):
+        self.assertIs(self.s.commenting_active(), expected)
+        self.assertIs(self.m._commenting_allowed(), expected)  # same answer
+
+    def test_all_on(self):
+        self._gates(False, True, True)
+        self._assert(True)
+
+    def test_env_kill_switch_outranks_runtime_toggle(self):
+        self._gates(True, True, True)
+        self._assert(False)
+
+    def test_master_pause_stops_comments_too(self):
+        self._gates(False, False, True)
+        self._assert(False)
+
+    def test_commenting_off_while_still_tracking(self):
+        # The point of the narrower switch: sampling continues, writes stop.
+        self._gates(False, True, False)
+        self._assert(False)
+
+
+class TestSamplingProfiles(unittest.TestCase):
+    """The runtime fast/relaxed switch and the gate it resizes."""
+
+    def test_profiles_differ_in_the_direction_advertised(self):
+        import config
+        fast = config.profile_settings("fast")
+        relaxed = config.profile_settings("relaxed")
+        self.assertLess(fast["new_video_check_interval"], relaxed["new_video_check_interval"])
+        self.assertLess(fast["active_video_check_interval"], relaxed["active_video_check_interval"])
+        self.assertGreater(fast["samples_per_run"], relaxed["samples_per_run"])
+        self.assertGreater(fast["fast_samples"], relaxed["fast_samples"])
+        self.assertGreaterEqual(fast["sample_concurrency"], relaxed["sample_concurrency"])
+
+    def test_unknown_profile_falls_back_to_the_default(self):
+        import config
+        self.assertEqual(config.profile_settings("nonsense"),
+                         config.SAMPLING_PROFILES[config.DEFAULT_SAMPLING_PROFILE])
+
+    def test_stored_garbage_falls_back(self):
+        import storage
+        orig = storage.get_setting
+        try:
+            for raw in ("turbo", "", None):
+                storage.get_setting = lambda k, d=None, r=raw: r if r is not None else d
+                storage._settings_cache.clear()
+                self.assertEqual(storage.sampling_profile(),
+                                 storage.DEFAULT_SAMPLING_PROFILE, raw)
+        finally:
+            storage.get_setting = orig
+            storage._settings_cache.clear()
+
+    def test_set_rejects_unknown_name(self):
+        import storage
+        with self.assertRaises(ValueError):
+            storage.set_sampling_profile("ludicrous")
+
+    def test_scheduler_reads_the_live_profile(self):
+        import main, config, storage
+        orig = storage.get_setting
+        try:
+            storage.get_setting = lambda k, d=None: "fast"
+            storage._settings_cache.clear()
+            self.assertEqual(main._sampling(), config.profile_settings("fast"))
+            storage.get_setting = lambda k, d=None: "relaxed"
+            storage._settings_cache.clear()
+            self.assertEqual(main._sampling(), config.profile_settings("relaxed"))
+        finally:
+            storage.get_setting = orig
+            storage._settings_cache.clear()
+
+    def test_gate_caps_concurrency_and_can_be_resized(self):
+        """A plain Semaphore cannot grow, which is why _Gate exists."""
+        import threading, time
+        import youtube_innertube as it
+
+        def peak_under(gate, limit, threads=10):
+            gate.set_limit(limit)
+            state = {"now": 0, "peak": 0}
+            lock = threading.Lock()
+
+            def work():
+                with gate:
+                    with lock:
+                        state["now"] += 1
+                        state["peak"] = max(state["peak"], state["now"])
+                    time.sleep(0.02)
+                    with lock:
+                        state["now"] -= 1
+
+            ts = [threading.Thread(target=work) for _ in range(threads)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+            return state["peak"]
+
+        gate = it._Gate(2)
+        self.assertEqual(peak_under(gate, 2), 2)
+        self.assertEqual(peak_under(gate, 5), 5)   # raised past its initial value
+        self.assertEqual(peak_under(gate, 1), 1)   # and back down
+
+
+class TestTrackingAgeCap(unittest.TestCase):
+    """MAX_TRACK_DAYS retires videos the stagnation rule would keep forever."""
+
+    def setUp(self):
+        import main
+        self.main = main
+
+    def test_age_helper(self):
+        from datetime import datetime, timedelta, timezone
+        m = self.main
+        orig, m.MAX_TRACK_DAYS = m.MAX_TRACK_DAYS, 7
+        try:
+            self.assertTrue(m._past_tracking_age(datetime.now() - timedelta(days=8)))
+            self.assertFalse(m._past_tracking_age(datetime.now() - timedelta(days=2)))
+            self.assertFalse(m._past_tracking_age(None))
+            # An aware datetime must not raise -- RSS parsing has produced them.
+            self.assertTrue(m._past_tracking_age(
+                datetime.now(timezone.utc) - timedelta(days=30)))
+            m.MAX_TRACK_DAYS = 0  # cap disabled
+            self.assertFalse(m._past_tracking_age(datetime.now() - timedelta(days=999)))
+        finally:
+            m.MAX_TRACK_DAYS = orig
+
+    def test_video_past_the_cap_is_retired_without_sampling(self):
+        from datetime import datetime, timedelta
+        m = self.main
+        retired, sampled = [], []
+        orig = (m.operations_enabled, m.mark_video_inactive, m.sample_titles, m.MAX_TRACK_DAYS)
+        m.operations_enabled = lambda *a, **k: True
+        m.mark_video_inactive = retired.append
+        m.sample_titles = lambda *a, **k: sampled.append(a) or []
+        m.MAX_TRACK_DAYS = 7
+        try:
+            m._check_one_active_video({
+                "video_id": "old1",
+                "channel_id": "@c",
+                "channel_name": "C",
+                "published_at": datetime.now() - timedelta(days=9),
+            }, refresh_meta=False)
+        finally:
+            (m.operations_enabled, m.mark_video_inactive,
+             m.sample_titles, m.MAX_TRACK_DAYS) = orig
+        self.assertEqual(retired, ["old1"])
+        self.assertEqual(sampled, [])  # retired before any sampling cost is paid
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

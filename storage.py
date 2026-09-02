@@ -1,5 +1,7 @@
 """PostgreSQL storage for channels, videos, title samples, and comments."""
 import os
+import threading
+import time
 from datetime import date, datetime
 from typing import List, Optional, Tuple
 
@@ -7,7 +9,15 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from psycopg2.pool import ThreadedConnectionPool
 
-from config import DATABASE_URL, DB_POOL_MAX, RATIO_WINDOW_DAYS, SCHEDULER_WORKERS
+from config import (
+    DATABASE_URL,
+    DB_POOL_MAX,
+    DEFAULT_SAMPLING_PROFILE,
+    RATIO_WINDOW_DAYS,
+    SKIP_COMMENT,
+    SAMPLING_PROFILES,
+    SCHEDULER_WORKERS,
+)
 
 # Connection pool. MUST be the *threaded* pool: the scheduler runs many worker
 # threads and Flask serves requests on its own threads, all sharing this pool.
@@ -87,6 +97,12 @@ def init_db():
                     last_seen_date DATE NOT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(video_id, title_text, first_seen_date)
+                );
+
+                CREATE TABLE IF NOT EXISTS app_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_videos_channel ON videos(channel_id);
@@ -178,6 +194,195 @@ def init_db():
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_channels_enabled ON channels(enabled)")
         conn.commit()
+    finally:
+        return_conn(conn)
+
+
+# ---------------------------------------------------------------------------
+# app_settings: small key/value store for runtime switches
+#
+# These are settings an operator flips at RUNTIME from the admin UI, as opposed
+# to the env vars in config.py which are deploy-time and need a redeploy. The
+# master operations switch lives here so the Railway deployment can keep serving
+# the dashboard (history stays online) while all outbound work is stopped.
+# ---------------------------------------------------------------------------
+OPERATIONS_ENABLED_KEY = "operations_enabled"
+COMMENTING_ENABLED_KEY = "commenting_enabled"
+SAMPLING_PROFILE_KEY = "sampling_profile"
+
+# Values that read as "off" in a stored switch. Everything else, including an
+# unset key, means on -- so a deployment that has never seen a switch behaves
+# exactly as it did before the switch existed.
+_OFF_VALUES = ("0", "false", "no", "off")
+
+# The scheduler consults the master switch on every loop tick and every video,
+# so the value is cached briefly rather than re-queried each time. The TTL is
+# short enough that a flip in the admin UI takes effect within seconds.
+_SETTINGS_TTL_SECONDS = 15
+_settings_cache: dict[str, tuple[float, Optional[str]]] = {}
+_settings_lock = threading.Lock()
+
+
+def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
+    """Read a runtime setting straight from Postgres (no cache)."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT value FROM app_settings WHERE key = %s", (key,))
+            row = cur.fetchone()
+            return row[0] if row else default
+    finally:
+        return_conn(conn)
+
+
+def set_setting(key: str, value: str) -> None:
+    """Write a runtime setting and invalidate the cached copy."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO app_settings (key, value, updated_at) "
+                "VALUES (%s, %s, CURRENT_TIMESTAMP) "
+                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, "
+                "updated_at = CURRENT_TIMESTAMP",
+                (key, value),
+            )
+        conn.commit()
+    finally:
+        return_conn(conn)
+    with _settings_lock:
+        _settings_cache.pop(key, None)
+
+
+def _cached_setting(key: str, default: str) -> str:
+    """Cached read of a runtime setting (TTL _SETTINGS_TTL_SECONDS).
+
+    Falls back to the last known value (or the default) if Postgres is briefly
+    unreachable -- a DB blip must not silently change the operating mode.
+    """
+    now = time.time()
+    with _settings_lock:
+        cached = _settings_cache.get(key)
+        if cached and now - cached[0] < _SETTINGS_TTL_SECONDS:
+            return cached[1] if cached[1] is not None else default
+    try:
+        value = get_setting(key)
+    except Exception:
+        return cached[1] if cached and cached[1] is not None else default
+    with _settings_lock:
+        _settings_cache[key] = (now, value)
+    return value if value is not None else default
+
+
+def operations_enabled(fresh: bool = False) -> bool:
+    """Master switch: is the tracker allowed to do outbound work at all?
+
+    Defaults to TRUE when unset, so an existing deployment keeps behaving
+    exactly as before until someone actually flips the switch. This is
+    ORTHOGONAL to the per-channel enabled flags -- flipping it never reads or
+    writes them, so the channel selection is preserved across a pause.
+    """
+    raw = get_setting(OPERATIONS_ENABLED_KEY, "1") if fresh \
+        else _cached_setting(OPERATIONS_ENABLED_KEY, "1")
+    return str(raw).strip().lower() not in _OFF_VALUES
+
+
+def set_operations_enabled(enabled: bool) -> None:
+    """Flip the master switch. Per-channel toggles are deliberately untouched."""
+    set_setting(OPERATIONS_ENABLED_KEY, "1" if enabled else "0")
+
+
+def commenting_enabled() -> bool:
+    """Second switch: is the tracker allowed to POST or EDIT YouTube comments?
+
+    Narrower than the master switch -- sampling and the dashboard carry on, only
+    the writes to YouTube stop. Kept separate because they are separate risks:
+    sampling is a read of public data, commenting is an automated write to other
+    people's videos, which is what gets an account spam-filtered.
+
+    The SKIP_COMMENT env var still hard-disables commenting regardless (see
+    config.SKIP_COMMENT); this is the runtime control that does not need a
+    redeploy, and it is seeded from SKIP_COMMENT on first boot.
+    """
+    return _cached_setting(COMMENTING_ENABLED_KEY, "1").strip().lower() not in _OFF_VALUES
+
+
+def set_commenting_enabled(enabled: bool) -> None:
+    set_setting(COMMENTING_ENABLED_KEY, "1" if enabled else "0")
+
+
+def commenting_active() -> bool:
+    """Whether comments are actually being posted right now.
+
+    All three gates, narrowest last: SKIP_COMMENT (deploy-level), the master
+    switch (stops everything), and the commenting switch. Defined once here
+    because the scheduler and the dashboard must agree -- a dashboard that says
+    "Posting..." while the scheduler is posting nothing is worse than no status
+    at all.
+    """
+    return not SKIP_COMMENT and operations_enabled() and commenting_enabled()
+
+
+def sampling_profile() -> str:
+    """Which sampling speed is active ("relaxed" or "fast").
+
+    Runtime-switchable like the other switches, so the aggressive cadence can be
+    turned on for a while (a launch worth watching closely) and off again with
+    no redeploy. An unrecognised or unset value falls back to the default.
+    """
+    name = _cached_setting(SAMPLING_PROFILE_KEY, DEFAULT_SAMPLING_PROFILE).strip().lower()
+    return name if name in SAMPLING_PROFILES else DEFAULT_SAMPLING_PROFILE
+
+
+def set_sampling_profile(name: str) -> None:
+    """Set the active sampling profile. Raises ValueError on an unknown name."""
+    name = (name or "").strip().lower()
+    if name not in SAMPLING_PROFILES:
+        raise ValueError(f"unknown sampling profile: {name!r}")
+    set_setting(SAMPLING_PROFILE_KEY, name)
+
+
+def seed_setting_if_missing(key: str, value: str) -> None:
+    """Write a setting only if it has never been set.
+
+    Used to seed a runtime switch from its deploy-time env var on first boot,
+    the same way channels are seeded from YOUTUBE_CHANNELS: the env var decides
+    the initial value, Postgres is the source of truth from then on, and a
+    redeploy never clobbers what an operator chose in the admin UI.
+    """
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO app_settings (key, value) VALUES (%s, %s) "
+                "ON CONFLICT (key) DO NOTHING",
+                (key, value),
+            )
+        conn.commit()
+    finally:
+        return_conn(conn)
+    with _settings_lock:
+        _settings_cache.pop(key, None)
+
+
+def bump_all_track_from_dates() -> int:
+    """Move every channel's tracking cutoff to today. Returns rows updated.
+
+    Called when the master switch is turned back ON. Without it, resuming after
+    a long pause would see a whole backlog of uploads sitting newer than each
+    channel's stored anchor and process the lot in one burst -- expensive, and a
+    flood of late comments on videos whose title tests ended weeks ago. Bumping
+    the cutoff reuses the exact no-backfill mechanism that add/re-enable already
+    uses (see set_channel_enabled), and touches only track_from_date -- never
+    the enabled flags.
+    """
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE channels SET track_from_date = CURRENT_DATE")
+            bumped = cur.rowcount
+        conn.commit()
+        return bumped
     finally:
         return_conn(conn)
 

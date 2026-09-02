@@ -24,16 +24,25 @@ from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-from config import parse_channels_str
+from config import SAMPLING_PROFILES, SKIP_COMMENT, parse_channels_str, profile_settings
 from scraper import resolve_channel_id
 from storage import (
     add_channel_admin,
+    commenting_active,
+    commenting_enabled,
     get_all_videos_summary,
     get_channels_with_metrics,
+    get_setting,
     get_title_daily_counts,
     get_video_info,
     init_db,
+    operations_enabled,
+    sampling_profile,
     set_channel_enabled,
+    set_commenting_enabled,
+    set_operations_enabled,
+    set_sampling_profile,
+    set_setting,
 )
 
 app = Flask(__name__)
@@ -316,6 +325,88 @@ def update_channel(channel_id: str):
         return _server_error(e)
 
 
+@app.route("/api/admin/operations", methods=["GET"])
+@require_admin
+def get_operations():
+    """Current state of the master tracking switch."""
+    try:
+        return jsonify({
+            "enabled": operations_enabled(fresh=True),
+            "changed_at": get_setting("operations_enabled_changed_at"),
+            "commenting": commenting_enabled(),
+            # SKIP_COMMENT is a deploy-time kill switch that outranks the runtime
+            # toggle. Report it so the UI can say the toggle is overridden rather
+            # than appear to accept a change that has no effect.
+            "commenting_forced_off": SKIP_COMMENT,
+            "sampling_profile": sampling_profile(),
+            # The concrete numbers behind each profile, so the UI can show what
+            # the choice actually costs instead of a vague "uses more".
+            "sampling_profiles": {
+                name: profile_settings(name) for name in SAMPLING_PROFILES
+            },
+        })
+    except Exception as e:
+        return _server_error(e)
+
+
+@app.route("/api/admin/operations", methods=["POST"])
+@require_admin
+def set_operations():
+    """Master switch: start or stop ALL outbound tracking work.
+
+    Off means the scheduler stops polling channels, stops sampling titles and
+    stops posting or editing comments -- while this web process keeps serving
+    the dashboard, so the site and its history stay online.
+
+    Also accepts ``commenting`` (stop only the writes to YouTube) and
+    ``sampling_profile`` ("relaxed" or "fast" -- how hard the sampler works).
+
+    This is a separate axis from the per-channel toggles and never touches them:
+    the channel selection is preserved exactly as-is across a pause. Turning
+    tracking back on moves every channel's cutoff to today (see
+    storage.bump_all_track_from_dates, applied by the scheduler), so the pause
+    window is not backfilled.
+    """
+    body = request.get_json(silent=True) or {}
+    keys = ("enabled", "commenting", "sampling_profile")
+    if not any(k in body for k in keys):
+        return jsonify({"error": f"one of {', '.join(keys)} is required"}), 400
+
+    try:
+        if "sampling_profile" in body:
+            try:
+                set_sampling_profile(str(body["sampling_profile"]))
+            except ValueError:
+                return jsonify({
+                    "error": f"sampling_profile must be one of "
+                             f"{', '.join(sorted(SAMPLING_PROFILES))}"
+                }), 400
+            logger.warning("Sampling profile set to %s by admin from %s",
+                           body["sampling_profile"], _client_ip())
+        if "commenting" in body:
+            # Narrower switch: stop writing comments to YouTube while sampling
+            # and the dashboard carry on.
+            commenting = bool(body["commenting"])
+            set_commenting_enabled(commenting)
+            logger.warning("Commenting %s by admin from %s",
+                           "ENABLED" if commenting else "DISABLED", _client_ip())
+        if "enabled" in body:
+            enabled = bool(body["enabled"])
+            set_operations_enabled(enabled)
+            set_setting("operations_enabled_changed_at",
+                        datetime.now().isoformat(timespec="seconds"))
+            logger.warning("Tracking %s by admin from %s",
+                           "ENABLED" if enabled else "PAUSED", _client_ip())
+        return jsonify({
+            "status": "ok",
+            "enabled": operations_enabled(fresh=True),
+            "commenting": commenting_enabled(),
+            "sampling_profile": sampling_profile(),
+        })
+    except Exception as e:
+        return _server_error(e)
+
+
 @app.route("/api/health", methods=["GET"])
 def health():
     """Health check endpoint."""
@@ -378,6 +469,14 @@ def get_stats():
             "inactive_videos": len(inactive),
             "total_in_db": len(all_videos),
             "ratio_window_days": RATIO_WINDOW_DAYS,
+            # Whether new data is still being collected. Public on purpose: it
+            # exposes nothing sensitive and it is the honest caption for a
+            # dashboard that has stopped updating.
+            "tracking_enabled": operations_enabled(),
+            # Whether comments are actually being posted -- the dashboard's
+            # comment column is meaningless without it (a video with 2+ variants
+            # and no comment is "posting soon" or "never", depending on this).
+            "commenting_enabled": commenting_active(),
         })
     except Exception as e:
         return _server_error(e)

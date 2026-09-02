@@ -13,6 +13,9 @@ with the historical title data.
 - Dashboard to view all tracked videos
 - Auto-detects when titles stabilize (marks inactive after 5 days)
 - Skips Shorts automatically
+- **Runtime switches** in the admin console — stop all tracking, stop only
+  commenting, or flip sampling speed — without a redeploy (see
+  [Running cost & the master switch](#running-cost--the-master-switch))
 
 ## How variant detection works
 
@@ -43,7 +46,7 @@ python test_logic.py                        # unit tests for the pure logic
 ```
 app.py               # Entry point (Railway)
 main.py              # Scheduler + video processing
-storage.py           # PostgreSQL database operations
+storage.py           # PostgreSQL database operations + runtime settings (master switch)
 scraper.py           # Video discovery (RSS) + title fetching
 youtube_innertube.py # InnerTube client: identity-rotating title sampler
 youtube_comment.py   # YouTube API for comments
@@ -107,16 +110,92 @@ Dashboard available at your Railway public URL.
 | `YOUTUBE_REFRESH_TOKEN` | Yes | — | From `get_refresh_token.py` |
 | `YOUTUBE_CHANNELS` | No | Veritasium | `@handle:name,@handle:name` format |
 | `CUTOFF_DATE` | No | 2026-02-08 | Only process videos after this date |
-| `NEW_VIDEO_CHECK_INTERVAL` | No | 180 | Seconds between new video checks |
-| `ACTIVE_VIDEO_CHECK_INTERVAL` | No | 3600 | Seconds between active video checks |
-| `SAMPLES_PER_RUN` | No | 21 | Total title samples per video |
-| `FAST_SAMPLES` | No | 5 | Quick samples before posting comment |
+| `NEW_VIDEO_CHECK_INTERVAL` | No | 1800 | Seconds between new video checks |
+| `ACTIVE_VIDEO_CHECK_INTERVAL` | No | 21600 | Seconds between re-sampling sweeps |
+| `SAMPLES_PER_RUN` | No | 15 | Title samples per video per sweep (cumulative across sweeps) |
+| `FAST_SAMPLES` | No | 30 | Quick samples before posting the first comment |
+| `SAMPLE_CONCURRENCY` | No | 4 | Max sampling requests in flight process-wide (caps peak memory) |
+| `FAST_MODE_*` | No | see table | Fast-profile overrides, e.g. `FAST_MODE_SAMPLES_PER_RUN` |
+| `SCHEDULER_WORKERS` | No | 6 | Scheduler thread-pool size |
 | `INACTIVE_DAYS_THRESHOLD` | No | 5 | Days of same title = finalized |
-| `SKIP_COMMENT` | No | 0 | Set to 1 to disable commenting |
+| `MAX_TRACK_DAYS` | No | 7 | Stop sampling a video once it's this old (0 = no cap) |
+| `SKIP_COMMENT` | No | 0 | Set to 1 to hard-disable commenting (outranks the admin toggle; seeds it on first boot) |
 | `ADMIN_TOKEN` | No | — | Secret to authorize admin endpoints (e.g. `/api/reset`). Unset = admin endpoints disabled |
 | `CORS_ORIGINS` | No | — | Comma-separated allowed origins for `/api/*`. Unset = same-origin only |
 | `RATE_LIMIT_PER_MINUTE` | No | 240 | Max requests per client IP per minute |
 | `RESET_RATE_LIMIT_PER_MINUTE` | No | 5 | Max `/api/reset` attempts per client IP per minute |
+
+## Running cost & the master switch
+
+The deployment is billed mostly on **resident memory**, around the clock —
+measured CPU use is near zero, so it is peak memory, not how hard the sampler
+works, that sets the bill. Peak memory comes from how many InnerTube responses
+are being parsed *at the same instant*: each `/next` response is a multi-megabyte
+JSON document that expands several-fold as Python objects, and neither CPython
+nor glibc hands that memory back afterwards — the process keeps its high-water
+mark until it restarts.
+
+What keeps it down:
+
+- `SAMPLE_CONCURRENCY` caps in-flight sampling requests process-wide (previously
+  each video fanned out to its own pool of 8, with no global ceiling).
+- `SCHEDULER_WORKERS` is small for the same reason.
+- `MALLOC_ARENA_MAX=2` in the start command stops glibc fragmenting the heap
+  across per-thread arenas, and `malloc_trim` runs after each sweep.
+- `MAX_TRACK_DAYS` retires old videos, so the active set stops growing forever.
+- The polling cadences are slow by default (30 min discovery, 6-hourly
+  re-sampling). They were originally tuned to comment first; that is no longer
+  the goal, and samples accumulate across sweeps, so a slower cadence costs time
+  to coverage, not accuracy. The old cadence is one toggle away when a particular
+  video is worth watching closely.
+
+### Master switch
+
+`/admin` has a single **Tracking** toggle at the top that stops *all* outbound
+work — channel polling, title sampling, and comment posting/editing — while the
+web process keeps serving the dashboard, so the site and its history stay online.
+
+It is a **separate axis from the per-channel toggles** and never reads or writes
+them: the channel selection survives a pause exactly as it was. Switching
+tracking back on moves every channel's cutoff to today, so uploads published
+during the pause are skipped rather than backfilled and commented on late.
+
+Underneath it is a second, narrower toggle: **Post comments**. It stops writing
+to YouTube (posting and editing) while title sampling and the dashboard carry on
+— the right setting when the tracker is still interesting but the commenting
+account is being spam-filtered, since sampling only reads public data whereas
+commenting is an automated write to other people's videos.
+
+### Sampling speed
+
+A third toggle, **Fast sampling**, switches between two profiles at runtime:
+
+| | Relaxed (default) | Fast |
+|---|---|---|
+| Feed check | every 30 min | every 3 min |
+| Re-sample sweep | every 6 h | every hour |
+| Samples per sweep | 15 | 40 |
+| Opening burst on a new video | 30 | 90 |
+| Concurrent requests | 4 | 8 |
+
+Fast is the original cadence: roughly **16× the sampling requests** and **10× the
+feed checks**. It is no longer a memory question — peak memory is capped by
+`sample_concurrency` in both profiles — so it costs request volume and a little
+CPU, not the runaway resident set that used to drive the bill. The admin UI shows
+these multipliers, computed from the live values, whenever fast mode is on.
+
+Each profile's numbers come from env vars: relaxed from the ones in the table
+above, fast from `FAST_MODE_`-prefixed equivalents (e.g.
+`FAST_MODE_SAMPLES_PER_RUN`).
+
+### Where the state lives
+
+All three switches live in the `app_settings` table (`operations_enabled`,
+`commenting_enabled`, `sampling_profile`), so they survive restarts and redeploys
+and take effect within ~15 seconds without one. Unset means ON / relaxed, so an
+existing deployment is unaffected until a switch is used. `SKIP_COMMENT` still
+works as a deploy-level kill switch that outranks the commenting toggle, and
+seeds it on first boot.
 
 ## Comment Format
 
@@ -137,11 +216,18 @@ Public (read-only — these power the dashboard website):
 - `GET /` - Dashboard
 - `GET /api/videos` - All videos with stats
 - `GET /api/video/<id>` - One video + title timeline
-- `GET /api/stats` - Summary counts
+- `GET /api/stats` - Summary counts, plus `tracking_enabled` / `commenting_enabled`
+  so the dashboard can say why it has stopped changing
 - `GET /api/health` - Health check
 
 Admin (requires the `ADMIN_TOKEN` secret):
 
+- `GET /api/admin/operations` - Master switch state
+- `POST /api/admin/operations` - Start/stop all tracking (`{"enabled": false}`),
+  commenting only (`{"commenting": false}`), or sampling speed
+  (`{"sampling_profile": "fast"}`)
+- `GET /api/admin/channels`, `POST /api/admin/channels`,
+  `POST /api/admin/channels/bulk`, `PATCH /api/admin/channels/<id>` - Channel management
 - `POST /api/reset` - Clear database. Send the token as `X-Admin-Token: <token>`
   or `Authorization: Bearer <token>`. **Disabled** (returns 503) when
   `ADMIN_TOKEN` is unset, so it can never be triggered anonymously.
@@ -168,12 +254,16 @@ All endpoints share these protections (the public site keeps working unchanged):
 
 ## How It Works
 
-1. Checks RSS feeds every 3 minutes for new videos
-2. New videos get `FAST_SAMPLES` quick samples (rotated identities) and a comment is posted immediately
-3. The rest of `SAMPLES_PER_RUN` samples are collected in the background
-4. Hourly checks re-sample active videos to detect new title variants
-5. Comments are updated only when the visible title history actually changes (saves API quota)
-6. Videos marked inactive after `INACTIVE_DAYS_THRESHOLD` days of the same single title
+0. Nothing below runs at all while the master switch is off
+1. Checks RSS feeds every `NEW_VIDEO_CHECK_INTERVAL` (default 30 min) for new videos
+2. New videos get `FAST_SAMPLES` quick samples (rotated identities); a comment is
+   posted as soon as 2+ distinct titles have actually been observed
+3. Re-sampling sweeps every `ACTIVE_VIDEO_CHECK_INTERVAL` (default 6 h) add
+   `SAMPLES_PER_RUN` more samples per active video — samples are cumulative, so
+   minority variants surface over hours
+4. Comments are updated only when the visible title history actually changes (saves API quota)
+5. Videos are retired after `INACTIVE_DAYS_THRESHOLD` days of the same single
+   title, or once they pass `MAX_TRACK_DAYS` regardless
 
 `YOUTUBE_CHANNELS` accepts either `@handle:Name` or a raw `UCxxxx...:Name` channel ID.
 
