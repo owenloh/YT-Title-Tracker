@@ -24,10 +24,11 @@ from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-from config import parse_channels_str
+from config import SKIP_COMMENT, parse_channels_str
 from scraper import resolve_channel_id
 from storage import (
     add_channel_admin,
+    commenting_enabled,
     get_all_videos_summary,
     get_channels_with_metrics,
     get_setting,
@@ -36,6 +37,7 @@ from storage import (
     init_db,
     operations_enabled,
     set_channel_enabled,
+    set_commenting_enabled,
     set_operations_enabled,
     set_setting,
 )
@@ -328,6 +330,11 @@ def get_operations():
         return jsonify({
             "enabled": operations_enabled(fresh=True),
             "changed_at": get_setting("operations_enabled_changed_at"),
+            "commenting": commenting_enabled(),
+            # SKIP_COMMENT is a deploy-time kill switch that outranks the runtime
+            # toggle. Report it so the UI can say the toggle is overridden rather
+            # than appear to accept a change that has no effect.
+            "commenting_forced_off": SKIP_COMMENT,
         })
     except Exception as e:
         return _server_error(e)
@@ -349,16 +356,29 @@ def set_operations():
     window is not backfilled.
     """
     body = request.get_json(silent=True) or {}
-    if "enabled" not in body:
-        return jsonify({"error": "enabled is required"}), 400
-    enabled = bool(body["enabled"])
+    if "enabled" not in body and "commenting" not in body:
+        return jsonify({"error": "enabled or commenting is required"}), 400
 
     try:
-        set_operations_enabled(enabled)
-        set_setting("operations_enabled_changed_at", datetime.now().isoformat(timespec="seconds"))
-        logger.warning("Tracking %s by admin from %s",
-                       "ENABLED" if enabled else "PAUSED", _client_ip())
-        return jsonify({"status": "ok", "enabled": enabled})
+        if "commenting" in body:
+            # Narrower switch: stop writing comments to YouTube while sampling
+            # and the dashboard carry on.
+            commenting = bool(body["commenting"])
+            set_commenting_enabled(commenting)
+            logger.warning("Commenting %s by admin from %s",
+                           "ENABLED" if commenting else "DISABLED", _client_ip())
+        if "enabled" in body:
+            enabled = bool(body["enabled"])
+            set_operations_enabled(enabled)
+            set_setting("operations_enabled_changed_at",
+                        datetime.now().isoformat(timespec="seconds"))
+            logger.warning("Tracking %s by admin from %s",
+                           "ENABLED" if enabled else "PAUSED", _client_ip())
+        return jsonify({
+            "status": "ok",
+            "enabled": operations_enabled(fresh=True),
+            "commenting": commenting_enabled(),
+        })
     except Exception as e:
         return _server_error(e)
 

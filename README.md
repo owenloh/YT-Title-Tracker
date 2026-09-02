@@ -117,7 +117,7 @@ Dashboard available at your Railway public URL.
 | `SCHEDULER_WORKERS` | No | 6 | Scheduler thread-pool size |
 | `INACTIVE_DAYS_THRESHOLD` | No | 5 | Days of same title = finalized |
 | `MAX_TRACK_DAYS` | No | 7 | Stop sampling a video once it's this old (0 = no cap) |
-| `SKIP_COMMENT` | No | 0 | Set to 1 to disable commenting |
+| `SKIP_COMMENT` | No | 0 | Set to 1 to hard-disable commenting (outranks the admin toggle; seeds it on first boot) |
 | `ADMIN_TOKEN` | No | — | Secret to authorize admin endpoints (e.g. `/api/reset`). Unset = admin endpoints disabled |
 | `CORS_ORIGINS` | No | — | Comma-separated allowed origins for `/api/*`. Unset = same-origin only |
 | `RATE_LIMIT_PER_MINUTE` | No | 240 | Max requests per client IP per minute |
@@ -156,9 +156,17 @@ them: the channel selection survives a pause exactly as it was. Switching
 tracking back on moves every channel's cutoff to today, so uploads published
 during the pause are skipped rather than backfilled and commented on late.
 
-The state lives in the `app_settings` table (key `operations_enabled`), so it
-survives restarts and redeploys and takes effect within ~15 seconds without one.
-Unset means ON, so an existing deployment is unaffected until the switch is used.
+Underneath it is a second, narrower toggle: **Post comments**. It stops writing
+to YouTube (posting and editing) while title sampling and the dashboard carry on
+— the right setting when the tracker is still interesting but the commenting
+account is being spam-filtered, since sampling only reads public data whereas
+commenting is an automated write to other people's videos.
+
+Both live in the `app_settings` table (keys `operations_enabled` and
+`commenting_enabled`), so they survive restarts and redeploys and take effect
+within ~15 seconds without one. Unset means ON, so an existing deployment is
+unaffected until a switch is used. `SKIP_COMMENT` still works as a deploy-level
+kill switch that outranks the runtime toggle, and seeds it on first boot.
 
 ## Comment Format
 
@@ -185,7 +193,8 @@ Public (read-only — these power the dashboard website):
 Admin (requires the `ADMIN_TOKEN` secret):
 
 - `GET /api/admin/operations` - Master switch state
-- `POST /api/admin/operations` - Start/stop all tracking: `{"enabled": false}`
+- `POST /api/admin/operations` - Start/stop all tracking (`{"enabled": false}`)
+  and/or commenting only (`{"commenting": false}`)
 - `GET /api/admin/channels`, `POST /api/admin/channels`,
   `POST /api/admin/channels/bulk`, `PATCH /api/admin/channels/<id>` - Channel management
 - `POST /api/reset` - Clear database. Send the token as `X-Admin-Token: <token>`

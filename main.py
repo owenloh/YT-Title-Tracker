@@ -42,6 +42,7 @@ from config import (
 )
 from scraper import get_videos_from_rss, is_short, sample_titles
 from storage import (
+    COMMENTING_ENABLED_KEY,
     add_title_sample,
     add_video,
     bump_all_track_from_dates,
@@ -56,10 +57,12 @@ from storage import (
     get_videos_without_comments,
     init_db,
     is_video_active,
+    commenting_enabled,
     mark_video_ignored,
     mark_video_inactive,
     operations_enabled,
     seed_channel_if_missing,
+    seed_setting_if_missing,
     set_comment_id,
     update_comment_edited,
     update_comment_meta,
@@ -72,6 +75,16 @@ from youtube_comment import fetch_comment_meta, post_comment, update_comment
 # I/O-bound work, so this can comfortably exceed CPU core count -- sized via
 # SCHEDULER_WORKERS to give headroom as more channels are tracked.
 executor = ThreadPoolExecutor(max_workers=SCHEDULER_WORKERS)
+
+def _commenting_allowed() -> bool:
+    """Whether a comment may be posted or edited right now.
+
+    Three independent gates, narrowest last: SKIP_COMMENT (deploy-level, needs a
+    redeploy), the master switch (stops everything), and the runtime commenting
+    switch (stops writes to YouTube while sampling and the dashboard continue).
+    """
+    return not SKIP_COMMENT and operations_enabled() and commenting_enabled()
+
 
 def _release_memory() -> None:
     """Hand freed heap back to the OS after a sweep.
@@ -213,7 +226,7 @@ def _maybe_update_comment(video_id: str, channel_name: str, before_titles) -> No
     per COMMENT_REFRESH_HOURS so we don't re-edit every hour (quota / "edited"
     spam). Identical text never triggers an edit.
     """
-    if SKIP_COMMENT or not operations_enabled():
+    if not _commenting_allowed():
         return
     state = get_comment_state(video_id, COMMENT_REFRESH_HOURS)
     if not state or not state["comment_id"]:
@@ -242,7 +255,7 @@ def _ensure_comment(video_id: str, channel_name: str, before_titles=None) -> Non
     (and most "first 15 samples" only ever see the dominant title). Existing
     comments are refreshed when a new variant turns up.
     """
-    if SKIP_COMMENT or not operations_enabled():
+    if not _commenting_allowed():
         return
     if get_comment_id(video_id):
         _maybe_update_comment(video_id, channel_name, before_titles)
@@ -288,7 +301,7 @@ def process_video(video_id: str, channel_id: str, channel_name: str, published_a
     # FAST PATH: brand-new video -> sample a quick burst, then deepen. We only
     # actually post once >= 2 variants are seen (see _ensure_comment), so a video
     # that isn't being A/B tested never gets a misleading "testing titles" comment.
-    if fast_first and new_video and not SKIP_COMMENT:
+    if fast_first and new_video and _commenting_allowed():
         try:
             quick = sample_titles(video_id, FAST_SAMPLES, parallel=True)
         except Exception as e:
@@ -588,10 +601,17 @@ def run_scheduler():
     # Reprocess any videos that have no comments (from failed earlier runs)
     reprocess_videos_without_comments()
 
+    # Seed the runtime commenting switch from the deploy-time env var the first
+    # time this database sees it; after that the admin UI owns it (same pattern
+    # as seeding channels from YOUTUBE_CHANNELS).
+    seed_setting_if_missing(COMMENTING_ENABLED_KEY, "0" if SKIP_COMMENT else "1")
+
     enabled_count = len(get_enabled_channels())
     running = operations_enabled(fresh=True)
     print(f"Starting scheduler:")
     print(f"  - Tracking (master switch): {'ON' if running else 'OFF (paused)'}")
+    print(f"  - Commenting: {'ON' if _commenting_allowed() else 'OFF'}"
+          f"{' (forced off by SKIP_COMMENT)' if SKIP_COMMENT else ''}")
     print(f"  - New video check: every {NEW_VIDEO_CHECK_INTERVAL}s")
     print(f"  - Active video check: every {ACTIVE_VIDEO_CHECK_INTERVAL}s")
     print(f"  - Samples per run: {SAMPLES_PER_RUN} (first burst {FAST_SAMPLES}, "

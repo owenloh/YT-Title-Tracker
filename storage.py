@@ -199,6 +199,12 @@ def init_db():
 # the dashboard (history stays online) while all outbound work is stopped.
 # ---------------------------------------------------------------------------
 OPERATIONS_ENABLED_KEY = "operations_enabled"
+COMMENTING_ENABLED_KEY = "commenting_enabled"
+
+# Values that read as "off" in a stored switch. Everything else, including an
+# unset key, means on -- so a deployment that has never seen a switch behaves
+# exactly as it did before the switch existed.
+_OFF_VALUES = ("0", "false", "no", "off")
 
 # The scheduler consults the master switch on every loop tick and every video,
 # so the value is cached briefly rather than re-queried each time. The TTL is
@@ -269,12 +275,54 @@ def operations_enabled(fresh: bool = False) -> bool:
     """
     raw = get_setting(OPERATIONS_ENABLED_KEY, "1") if fresh \
         else _cached_setting(OPERATIONS_ENABLED_KEY, "1")
-    return str(raw).strip().lower() not in ("0", "false", "no", "off")
+    return str(raw).strip().lower() not in _OFF_VALUES
 
 
 def set_operations_enabled(enabled: bool) -> None:
     """Flip the master switch. Per-channel toggles are deliberately untouched."""
     set_setting(OPERATIONS_ENABLED_KEY, "1" if enabled else "0")
+
+
+def commenting_enabled() -> bool:
+    """Second switch: is the tracker allowed to POST or EDIT YouTube comments?
+
+    Narrower than the master switch -- sampling and the dashboard carry on, only
+    the writes to YouTube stop. Kept separate because they are separate risks:
+    sampling is a read of public data, commenting is an automated write to other
+    people's videos, which is what gets an account spam-filtered.
+
+    The SKIP_COMMENT env var still hard-disables commenting regardless (see
+    config.SKIP_COMMENT); this is the runtime control that does not need a
+    redeploy, and it is seeded from SKIP_COMMENT on first boot.
+    """
+    return _cached_setting(COMMENTING_ENABLED_KEY, "1").strip().lower() not in _OFF_VALUES
+
+
+def set_commenting_enabled(enabled: bool) -> None:
+    set_setting(COMMENTING_ENABLED_KEY, "1" if enabled else "0")
+
+
+def seed_setting_if_missing(key: str, value: str) -> None:
+    """Write a setting only if it has never been set.
+
+    Used to seed a runtime switch from its deploy-time env var on first boot,
+    the same way channels are seeded from YOUTUBE_CHANNELS: the env var decides
+    the initial value, Postgres is the source of truth from then on, and a
+    redeploy never clobbers what an operator chose in the admin UI.
+    """
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO app_settings (key, value) VALUES (%s, %s) "
+                "ON CONFLICT (key) DO NOTHING",
+                (key, value),
+            )
+        conn.commit()
+    finally:
+        return_conn(conn)
+    with _settings_lock:
+        _settings_cache.pop(key, None)
 
 
 def bump_all_track_from_dates() -> int:

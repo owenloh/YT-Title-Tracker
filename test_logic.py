@@ -292,6 +292,41 @@ class TestMasterSwitch(unittest.TestCase):
         self.assertEqual(called, [])  # no DB reads, no network, no comments
 
 
+class TestCommentingGate(unittest.TestCase):
+    """main._commenting_allowed: three independent gates, narrowest last."""
+
+    def setUp(self):
+        import main
+        self.m = main
+        self._orig = (main.SKIP_COMMENT, main.operations_enabled, main.commenting_enabled)
+
+    def tearDown(self):
+        (self.m.SKIP_COMMENT, self.m.operations_enabled,
+         self.m.commenting_enabled) = self._orig
+
+    def _gates(self, skip, master, commenting):
+        self.m.SKIP_COMMENT = skip
+        self.m.operations_enabled = lambda *a, **k: master
+        self.m.commenting_enabled = lambda *a, **k: commenting
+
+    def test_all_on(self):
+        self._gates(False, True, True)
+        self.assertTrue(self.m._commenting_allowed())
+
+    def test_env_kill_switch_outranks_runtime_toggle(self):
+        self._gates(True, True, True)
+        self.assertFalse(self.m._commenting_allowed())
+
+    def test_master_pause_stops_comments_too(self):
+        self._gates(False, False, True)
+        self.assertFalse(self.m._commenting_allowed())
+
+    def test_commenting_off_while_still_tracking(self):
+        # The point of the narrower switch: sampling continues, writes stop.
+        self._gates(False, True, False)
+        self.assertFalse(self.m._commenting_allowed())
+
+
 class TestTrackingAgeCap(unittest.TestCase):
     """MAX_TRACK_DAYS retires videos the stagnation rule would keep forever."""
 
